@@ -1,8 +1,9 @@
 # Registry
 
-A reactive key/value store system for PySide6 applications. Combines a **settings store** and a **theme store** under a single registry, with a `@registry.reactive` decorator that automatically re-runs methods when the values they read change.
+A reactive key/value store system for PySide6 applications. Combines a **settings store** and a **theme store** under a single registry, with a `@registry.reactive` decorator that automatically re-runs methods when the values they read change — no manual signal wiring required.
 
-# Work in progress - 0.1
+
+# Work in progress - 0.2
 
 ---
 
@@ -51,7 +52,7 @@ class MyWidget(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.refresh()  # first call — tracks keys, wires all signal connections
+        self.refresh()  # first call — tracks keys and wires all signal connections
 ```
 
 After this, calling `settings.set("volume", 80)` or `theme.toggle_mode()` will automatically re-run `refresh()` on every wired instance — no manual signal wiring required.
@@ -72,13 +73,13 @@ settings.get("volume")             # current value, or None if not set
 settings.get("volume", default=0)  # current value, or 0 if not set
 
 # Writing
-settings.set("volume", 80)         # emits signals if value changed
+settings.set("volume", 80)         # emits signals only if value changed
 
 # Bulk operations
 settings.load_dict({"volume": 80, "muted": True})
 settings.as_dict()                  # shallow snapshot of all values
 
-# Subscribing
+# Subscribing manually
 settings.on("volume").connect(cb)   # cb(new_value) — fires for this key only
 settings.changed.connect(cb)        # cb(key, value) — fires for every change
 ```
@@ -120,7 +121,7 @@ theme.active_theme                     # name of active theme (str | None)
 theme.active_mode                      # "dark" or "light"
 theme.as_dict()                        # shallow snapshot of active tokens
 
-# Subscribing
+# Subscribing manually
 theme.on("color.background").connect(cb)  # cb(new_value) for this token
 theme.changed.connect(cb)                 # cb(key, value) per changed token
 theme.theme_changed.connect(cb)           # cb(name, mode) once per switch
@@ -140,7 +141,7 @@ theme.unregister("catppuccin")  # raises RuntimeError if currently active
 
 ## Reactivity
 
-### `@registry.reactive`
+### `@registry.reactive` — per-instance tracking
 
 Wrap any instance method that reads from `settings` or `theme`. On the **first call** to the method on a given instance, every `.get()` access across both stores is recorded as a dependency. One Qt signal connection is wired per unique `(store, key)` pair, and the method re-runs automatically whenever any of those values change.
 
@@ -161,27 +162,51 @@ class PlayerControls(QWidget):
         self.refresh()  # first call wires everything
 ```
 
-### How it works
+Each instance gets its own set of signal connections. When the instance is garbage collected, a `weakref` finalizer disconnects all connections automatically — no manual cleanup needed.
 
-1. The first call runs the method inside a tracking context.
-2. Every `.get()` call appends `(store, key)` to the active context.
-3. After the method returns, one Qt signal connection is created per unique `(store, key)` pair.
-4. The signal handler re-runs the method on the same instance whenever that key changes.
-5. Subsequent calls to the method skip tracking and run directly.
-6. When the instance is garbage collected, a `weakref` finalizer disconnects all signals automatically — **no manual cleanup needed**.
+---
 
-### Important constraint
+### `@registry.reactive_class` — class-level tracking
 
-> Every key that should trigger re-runs must be read **unconditionally** on the first call. A key accessed only inside a branch that does not execute on the first call will not be tracked and will not cause a re-run.
+For classes where many instances exist and all should update together, apply `@registry.reactive_class` to the class. The **first instance** to call the reactive method triggers dependency tracking and wires one Qt signal connection per `(store, key)` pair for the **entire class**. When a tracked key changes, a single Qt dispatch calls the method on every currently living instance via a `WeakSet`.
+
+```python
+@registry.reactive_class
+class VolumeLabel(QLabel):
+
+    @registry.reactive
+    def refresh(self):
+        vol = settings.get("volume")
+        bg  = theme.get("color.background")
+        self.setText(f"Volume: {vol}")
+        self.setStyleSheet(f"background: {bg};")
+
+    def __init__(self):
+        super().__init__()
+        self.refresh()  # first instance: tracks + wires; later instances: join + run
+```
+
+**When to prefer `@registry.reactive_class`:**
+- You create many instances of the same widget class (e.g. a row of badges or list items).
+- All instances read the same keys unconditionally.
+- You want a single Qt signal dispatch to update every instance rather than one dispatch per instance.
+
+> **Constraint:** tracking is done once using the first instance. All instances must read the same keys unconditionally. Keys only read by later instances will never be tracked.
+
+---
+
+## The tracking constraint
+
+Every key that should trigger re-runs must be read **unconditionally** on the first call. A key accessed only inside a branch that does not execute on the first call will not be tracked.
 
 ```python
 @registry.reactive
 def refresh(self):
-    vol  = settings.get("volume")  # ✓ always read — always tracked
+    vol  = settings.get("volume")   # ✓ always read — always tracked
     mode = settings.get("mode")
 
     if mode == "advanced":
-        eq = settings.get("equalizer")  # ✗ only read in one branch — may not be tracked
+        eq = settings.get("equalizer")  # ✗ only read in one branch — may miss tracking
 ```
 
 To track `"equalizer"` unconditionally, read it before any branching:
@@ -197,33 +222,42 @@ def refresh(self):
         self.eq_widget.setValue(eq)
 ```
 
-### Nested reactive methods
+---
 
-Tracking uses a per-thread stack, so nested reactive calls each collect their own dependencies independently without interfering with each other.
+## How tracking works internally
+
+1. The first call runs the method inside a tracking context.
+2. Every `.get()` call appends `(store, key)` to the active context's dependency list.
+3. After the method returns, the list is deduplicated and one Qt signal connection is created per unique `(store, key)` pair.
+4. The signal handler re-runs the method on the same instance whenever that key changes.
+5. Subsequent calls skip tracking and run the method directly.
+6. When the instance is GC'd, a `weakref` finalizer calls `disconnect_conns` to clean up all connections.
+
+Tracking uses a per-thread stack of dependency lists, so nested reactive calls each collect their own dependencies without interfering with each other.
 
 ---
 
-## Thread Safety
+## Thread safety
 
 `settings.set()`, `theme.set_theme()`, `theme.set_mode()`, and `theme.register()` must be called from the **Qt main thread**. To update a setting from a worker thread, post to the main thread via `QMetaObject.invokeMethod` or a queued signal connection.
 
 ---
 
-## Signals Reference
+## Signals reference
 
-| Signal | Store | Args | When |
+| Signal | Store | Arguments | When it fires |
 |---|---|---|---|
-| `settings.on(key)` | SettingsModel | `(new_value,)` | Key changed |
+| `settings.on(key)` | SettingsModel | `(new_value,)` | That key changed |
 | `settings.changed` | SettingsModel | `(key, value)` | Any key changed |
-| `theme.on(key)` | ThemeStore | `(new_value,)` | Token changed |
+| `theme.on(key)` | ThemeStore | `(new_value,)` | That token changed |
 | `theme.changed` | ThemeStore | `(key, value)` | Any token changed |
 | `theme.theme_changed` | ThemeStore | `(name, mode)` | Theme or mode switched |
 
-Per-key `.on(key)` always fires **before** the broader `.changed` signal. `theme.theme_changed` fires last, after all per-token signals.
+Per-key `.on(key)` always fires **before** the broader `.changed` signal. `theme.theme_changed` fires last, after all per-token signals. State is fully committed before any signal fires, so handlers always see the new values.
 
 ---
 
-## Imports Reference
+## Imports reference
 
 ```python
 from Registry import settings   # SettingsModel singleton
