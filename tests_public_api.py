@@ -244,8 +244,6 @@ def test_theme_on_signal():
     app.processEvents()
     assert "#fff" in received
 
-# FIX 1a: renamed from test_theme_changed_signal (was duplicated) to clearly
-# describe what it tests: the per-token .changed signal fires for each changed token.
 def test_theme_changed_per_token_signal():
     t = make_theme()
     t.register("base", DARK_LIGHT)
@@ -278,8 +276,6 @@ def test_theme_on_fires_before_changed():
     app.processEvents()
     assert order.index("on") < order.index("changed")
 
-# FIX 1b: renamed from test_theme_changed_signal (the duplicate that clobbered
-# the above) to clearly describe what it tests: the .theme_changed signal.
 def test_theme_theme_changed_signal():
     t = make_theme()
     t.register("base", DARK_LIGHT)
@@ -389,19 +385,6 @@ def test_theme_register_replaces_active():
     assert received == ["#222"]
     assert t.get("color.bg") == "#222"
 
-
-# ---------------------------------------------------------------------------
-# @registry.reactive
-#
-# FIX 3: _FakeWidget now uses its own local Registry instance so the
-# @reactive decorator and the store instances that .get() is called on are
-# from the same registry. Previously, @registry.reactive (global singleton)
-# was used as the decorator while self._s / self._t were separate store
-# instances — misleading, though coincidentally correct because _record()
-# uses the store instance from the .get() call, not the stores passed to
-# ReactiveDescriptor. Using a local registry makes the intent explicit and
-# removes the dependency on that implementation detail.
-# ---------------------------------------------------------------------------
 
 def _make_local_registry():
     """Return a fresh Registry with its own SettingsModel and ThemeStore."""
@@ -579,9 +562,6 @@ TESTS = [
     ("theme: set_theme keeps current mode",                 test_theme_set_theme_keeps_mode),
     ("theme: as_dict returns snapshot",                     test_theme_as_dict),
     ("theme: on signal fires on token change",              test_theme_on_signal),
-    # FIX 1: was two entries both named "theme: changed signal fires..." both
-    # pointing to the second (duplicate) definition of test_theme_changed_signal.
-    # Now correctly split into two distinct entries with distinct functions.
     ("theme: changed signal fires per changed token",       test_theme_changed_per_token_signal),
     ("theme: unchanged token emits no signal",              test_theme_unchanged_token_no_signal),
     ("theme: on fires before changed",                      test_theme_on_fires_before_changed),
