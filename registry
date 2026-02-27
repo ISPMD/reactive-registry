@@ -1,0 +1,329 @@
+"""
+Reactive Settings Model for PySide6
+-------------------------------------
+Use @settings.reactive to auto-connect a function to the keys it accesses.
+
+Public API
+----------
+Construction:
+    settings = SettingsModel(
+        defaults = {"volume": 50, "dark_mode": False},  # initial values
+    )
+    # None is not a valid value — ValueError is raised if any default is None.
+
+Reading and writing:
+    settings.get("volume")             # returns current value
+    settings.get("volume", default=0)  # returns default if key missing
+    settings.set("volume", 80)         # sets value, emits signals if changed
+                                       # raises TypeError if value is None
+    settings.as_dict()                 # returns snapshot dict of all values
+    settings.load_dict({"volume": 80}) # bulk-load from a dict, signals fire for changes
+
+Subscribing to changes:
+    settings.on("volume").connect(callback)  # fires when "volume" changes
+    settings.changed.connect(callback)       # fires on every change: (key, value)
+
+Reactive methods:
+    class MyWidget(QWidget):
+        @settings.reactive
+        def refresh(self):
+            # Keys accessed via settings.get() on the first call are tracked.
+            # refresh() will re-run automatically whenever any of those keys change.
+            # IMPORTANT: tracking happens on the first call only — access all keys
+            # unconditionally so they are reliably captured. A key only read inside
+            # an if-branch that doesn't execute on the first call will not be tracked.
+            self.label.setText(settings.get("username"))
+            self.slider.setValue(settings.get("volume"))
+
+        def __init__(self):
+            self.refresh()  # call once — tracking and wiring happen here
+                            # connections are cleaned up automatically when the
+                            # instance is garbage collected — no manual cleanup needed
+
+Signals:
+    settings.changed(key: str, value: Any)  # emitted on every change
+"""
+
+import threading
+import weakref
+from typing import Any
+from functools import wraps, partial
+from PySide6.QtCore import QObject, Signal
+
+# Per-thread tracking stack used to record which settings keys are read inside
+# a reactive function. Each reactive call pushes a fresh empty set, collects keys
+# into it via _record(), then pops it off after fn returns. Using a stack rather
+# than a single global slot means nested reactive calls each track their own
+# dependencies without overwriting each other.
+_TL = threading.local()
+
+
+def _push_tracking() -> set:
+    try:
+        stack = _TL.stack
+    except AttributeError:
+        _TL.stack = stack = []
+    s: set = set()
+    stack.append(s)
+    return s
+
+
+def _pop_tracking() -> set:
+    return _TL.stack.pop()
+
+
+def _record(key: str) -> None:
+    """Add key to the innermost active tracking set, if any.
+    Called by SettingsModel.get() — silently does nothing outside a reactive call."""
+    stack = _TL.__dict__.get("stack")
+    if stack:
+        stack[-1].add(key)
+
+
+def _values_equal(a: Any, b: Any) -> bool:
+    """
+    Safe equality check that never raises.
+
+    Checks identity first (fast path — same object in memory is always equal).
+    Falls back to ==, but guards against two failure modes:
+      - == raising an exception (e.g. comparing incompatible types)
+      - == returning a non-bool (e.g. numpy arrays return an array, not True/False)
+    In either failure case we conservatively return False so the update goes through.
+    """
+    if a is b:
+        return True
+    try:
+        result = a == b
+        if isinstance(result, bool):
+            return result
+        return bool(result)
+    except Exception:
+        return False
+
+
+class SettingsModel(QObject):
+    """
+    A key/value store whose changes are observable via Qt signals.
+
+    Values can be watched per-key with .on(key), or globally with .changed.
+    Class methods can be auto-wired to the keys they read using @settings.reactive.
+
+    None is intentionally not a valid value — it would be indistinguishable
+    from a missing key when returned by get(). Use a sentinel (e.g. "") or
+    simply omit the key to represent an absent value.
+      - set() raises TypeError if value is None.
+      - __init__() raises ValueError if any default value is None.
+    """
+
+    # Emitted after every successful set() call: (key, new_value).
+    # Always fires after the per-key .on(key) signal — per-key listeners
+    # do their work first, then global listeners see the change.
+    changed = Signal(str, object)
+
+    def __init__(self, defaults: dict[str, Any] | None = None, parent=None):
+        super().__init__(parent)
+
+        self._store: dict[str, Any] = {}
+        self._key_signals: dict[str, "_KeySignalEmitter"] = {}
+
+        if defaults is not None:
+            none_keys = [k for k, v in defaults.items() if v is None]
+            if none_keys:
+                raise ValueError(
+                    f"None is not a valid settings value. "
+                    f"Keys with None in defaults: {none_keys}"
+                )
+            self._store.update(defaults)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Return the current value for key, or default if the key has not been set.
+        When called inside a @reactive method, also records the key as a dependency
+        so the method is re-run whenever this key changes."""
+        _record(key)
+        return self._store.get(key, default)
+
+    def set(self, key: str, value: Any) -> None:
+        """Set key to value. Emits .on(key) and .changed only if the value actually changed.
+        No-ops if the new value is equal to the current one.
+        Raises TypeError if value is None — use a sentinel or omit the key instead."""
+        if value is None:
+            raise TypeError(
+                f"None is not a valid settings value (key: {key!r}). "
+                f"Use a sentinel value or omit the key instead."
+            )
+        if _values_equal(self._store.get(key), value):
+            return
+        self._store[key] = value
+        emitter = self._key_signals.get(key)
+        if emitter:
+            emitter.sig.emit(value)     # per-key listeners fire first
+        self.changed.emit(key, value)   # global listeners fire second
+
+    def on(self, key: str) -> Signal:
+        """Return the per-key signal for key, creating it on demand.
+        Emits (new_value,) whenever that key is updated to a different value.
+        Prefer this over .changed when you only care about a single key."""
+        if key not in self._key_signals:
+            self._key_signals[key] = _KeySignalEmitter(self)
+        return self._key_signals[key].sig
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a shallow snapshot of all current values."""
+        return dict(self._store)
+
+    def load_dict(self, data: dict[str, Any]) -> None:
+        """Bulk-load values from a dict. Delegates to set() for each key, so
+        signals fire normally for changed keys and None values are still rejected."""
+        for key, value in data.items():
+            self.set(key, value)
+
+    def reactive(self, fn):
+        """
+        Decorator for class methods that auto-connects them to the settings
+        keys they read.
+
+        How it works
+        ------------
+        The first time the decorated method is called on an instance, it runs
+        normally while key tracking is active. Every settings.get() call inside
+        the method records that key as a dependency. After the method returns, a
+        Qt signal connection is created for each recorded key so that the method
+        re-runs automatically on the same instance whenever any of those keys
+        changes via set().
+
+        Subsequent calls skip tracking and run the method directly — the
+        connections established on the first call remain in place until the
+        instance is garbage collected, at which point a weakref finalizer
+        disconnects them automatically. No manual cleanup is needed.
+
+        Constraint: access all keys unconditionally
+        -------------------------------------------
+        Because tracking only happens on the first call, every key that should
+        trigger re-runs must be read on that first call. A key hidden behind a
+        conditional branch that doesn't execute on the first call will never be
+        tracked and will never trigger a re-run.
+
+        Usage:
+            class MyWidget(QWidget):
+                @settings.reactive
+                def refresh(self):
+                    self.label.setText(settings.get("username"))
+                    self.slider.setValue(settings.get("volume"))
+
+                def __init__(self):
+                    self.refresh()  # first call — tracks keys, wires connections
+        """
+        return _ReactiveDescriptor(fn, self)
+
+
+class _ReactiveDescriptor:
+    """
+    The object returned by @settings.reactive. Only supports class methods.
+
+    Acts as a descriptor so that accessing the decorated method on an instance
+    (e.g. self.refresh) triggers __get__, which returns a partial with the
+    instance pre-bound as the first argument.
+
+    Each instance gets its own connection list stored in _inst_conns, a
+    WeakKeyDictionary keyed by the instance. A weakref finalizer registered
+    on the first per-instance call disconnects all signals automatically when
+    the instance is garbage collected — no manual cleanup is needed.
+    """
+
+    def __init__(self, fn, model: SettingsModel) -> None:
+        self._fn = fn
+        self._model = model
+        self._inst_conns: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        wraps(fn)(self)
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return partial(self._run, obj)
+
+    def _run(self, obj):
+        if obj not in self._inst_conns:
+            self._inst_conns[obj] = []
+        conns = self._inst_conns[obj]
+
+        if conns:
+            # Already wired — subsequent call, just run the method.
+            # Signal connections from the first call remain active; no re-tracking needed.
+            self._fn(obj)
+            return
+
+        # First call — run fn inside a tracking context so every settings.get()
+        # call records its key. _push_tracking() / _pop_tracking() use a per-thread
+        # stack, so nested reactive calls each track their own keys independently.
+        _push_tracking()
+        try:
+            self._fn(obj)
+            tracked_keys = _pop_tracking()
+        except Exception:
+            _pop_tracking()
+            raise
+
+        # Wire a Qt signal connection for each key read during the first call.
+        # The handler re-runs the method on the same instance whenever the key changes.
+        for key in tracked_keys:
+            handler = lambda new_value, o=obj: self._fn(o)
+            self._model.on(key).connect(handler)
+            conns.append((key, handler))
+
+        # Register a weakref finalizer so Qt signals are explicitly disconnected
+        # when the instance is garbage collected.
+        #
+        # Only register if at least one key was tracked — if refresh() read no
+        # settings keys there is nothing to disconnect.
+        #
+        # We pass list(conns) — a snapshot — rather than the live list itself.
+        # The live list lives inside a WeakKeyDictionary keyed by the instance;
+        # by the time the finalizer fires that entry may already have been removed
+        # by the GC. The snapshot is an independent object unaffected by that.
+        if conns:
+            weakref.finalize(obj, _disconnect_conns, list(conns), self._model)
+
+
+def _disconnect_conns(conns: list, model: "SettingsModel") -> None:
+    """
+    Disconnect every (key, handler) pair in conns from its per-key signal, then
+    clear the list so handlers can be garbage collected.
+
+    Defined at module level rather than as a method on _ReactiveDescriptor so
+    that weakref.finalize can call it safely after the widget instance has been
+    destroyed — finalizers must not hold strong references to the object being
+    watched, so a plain function receiving model and conns as arguments is the
+    correct pattern.
+
+    The RuntimeError guard handles the case where the signal or its emitter
+    was already destroyed (e.g. if the model is torn down before the instance).
+    """
+    for key, handler in conns:
+        emitter = model._key_signals.get(key)
+        if emitter:
+            try:
+                emitter.sig.disconnect(handler)
+            except RuntimeError:
+                pass
+    conns.clear()
+
+
+class _KeySignalEmitter(QObject):
+    """
+    Minimal QObject that hosts a single per-key signal.
+
+    Qt requires signals to be class-level attributes on a QObject subclass,
+    so they cannot be attached dynamically to SettingsModel itself. Instead,
+    one _KeySignalEmitter is created per key on demand and parented to the
+    model, meaning it is destroyed automatically when the model is destroyed.
+
+    This is efficient for typical settings sizes (tens to low hundreds of keys).
+    """
+    sig = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
