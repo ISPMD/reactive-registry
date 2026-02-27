@@ -11,6 +11,12 @@ Covers:
     @registry.reactive — dependency tracking, auto re-run, multi-store,
                          deduplication, GC cleanup
 
+Benchmarks (10 000 reactive instances each):
+    memory         — peak tracemalloc allocation while 10 000 instances are live
+    settings read  — settings.get() throughput across all instances
+    theme read     — theme.get() throughput across all 10 tokens × all instances
+    switch (10 keys) — full set_mode() diff + signal fan-out to all instances
+
 Run:
     python test_public_api.py
 """
@@ -18,6 +24,8 @@ Run:
 import sys
 import gc
 import weakref
+import time
+import tracemalloc
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QObject
 
@@ -386,6 +394,10 @@ def test_theme_register_replaces_active():
     assert t.get("color.bg") == "#222"
 
 
+# ---------------------------------------------------------------------------
+# @registry.reactive helpers
+# ---------------------------------------------------------------------------
+
 def _make_local_registry():
     """Return a fresh Registry with its own SettingsModel and ThemeStore."""
     from Registry.Registry import Registry as _Registry
@@ -412,6 +424,10 @@ def _make_fake_widget(r):
 
     return _FakeWidget
 
+
+# ---------------------------------------------------------------------------
+# @registry.reactive
+# ---------------------------------------------------------------------------
 
 def test_reactive_first_call_runs():
     r = _make_local_registry()
@@ -488,13 +504,7 @@ def test_reactive_subsequent_calls_do_not_rewire():
     assert len(w.calls) == 4  # signal fired once, not multiple times
 
 def test_reactive_gc_disconnects():
-    """Connections should be cleaned up when the instance is garbage collected.
-
-    FIX 2: strengthened to assert the connection *was* wired before GC so the
-    test cannot silently pass due to a wiring bug. We check that the signal
-    fires while the instance is alive (proving wiring succeeded), then verify
-    it does not fire after GC (proving cleanup succeeded).
-    """
+    """Connections should be cleaned up when the instance is garbage collected."""
     r = _make_local_registry()
     calls = []
 
@@ -588,6 +598,205 @@ TESTS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Benchmarks
+# ---------------------------------------------------------------------------
+# All four benchmarks share a single registry and a single pool of 10 000
+# wired instances so construction cost is paid once and not counted in the
+# read or switch timings.
+#
+# Theme definition uses 10 fully-distinct tokens (all values differ between
+# dark and light) so every set_mode() flip triggers the maximum diff and
+# signal fan-out: 10 tokens × 10 000 instances = 100 000 deliveries per flip.
+#
+# Reported metrics
+# ----------------
+#   memory   — net Python heap delta (tracemalloc) while instances are live,
+#              reported as total and per-instance.
+#              Note: Qt C++ heap is not tracked by tracemalloc; actual RSS
+#              will be higher. This measures the Python-side overhead only.
+#
+#   settings read — wall time for N_INSTANCES × READ_ITERATIONS calls to
+#                   settings.get() outside any tracking context, plus
+#                   throughput in calls/sec and cost per call.
+#
+#   theme read    — same, but for theme.get() across all 10 tokens per instance.
+#
+#   switch        — wall time for SWITCH_ITERATIONS set_mode() flips, each
+#                   followed by processEvents() to flush all signal deliveries.
+#                   Reports per-switch latency and aggregate delivery rate.
+# ---------------------------------------------------------------------------
+
+# 10-token theme: all values differ between dark and light so every flip
+# changes all 10 tokens and exercises the full diff + fan-out path.
+_BENCH_DARK  = {f"token.{i}": f"#dark{i:02d}" for i in range(10)}
+_BENCH_LIGHT = {f"token.{i}": f"#lite{i:02d}" for i in range(10)}
+_BENCH_THEME = {"dark": _BENCH_DARK, "light": _BENCH_LIGHT}
+
+N_INSTANCES      = 10_000
+READ_ITERATIONS  = 100    # repeat reads to get a stable wall-clock sample
+SWITCH_ITERATIONS = 20    # each flip is expensive; 20 gives a stable average
+
+
+def _make_bench_registry():
+    """Fresh registry with a 10-token theme and one settings key."""
+    from Registry.Registry import Registry as _Registry
+    r = _Registry()
+    r.settings.set("value", 0)
+    r.theme.register("bench", _BENCH_THEME)
+    r.theme.set_theme("bench")
+    return r
+
+
+def _make_bench_widget_class(r):
+    """Widget that reads one settings key and all 10 theme tokens on refresh."""
+
+    class BenchWidget(QObject):
+        def __init__(self):
+            super().__init__()
+
+        @r.reactive
+        def refresh(self):
+            r.settings.get("value")
+            for i in range(10):
+                r.theme.get(f"token.{i}")
+
+    return BenchWidget
+
+
+def _fmt_time(seconds):
+    if seconds < 1e-6:
+        return f"{seconds * 1e9:.1f} ns"
+    if seconds < 1e-3:
+        return f"{seconds * 1e6:.2f} µs"
+    if seconds < 1:
+        return f"{seconds * 1e3:.2f} ms"
+    return f"{seconds:.3f} s"
+
+
+def _fmt_mem(nbytes):
+    if nbytes < 1024:
+        return f"{nbytes} B"
+    if nbytes < 1024 ** 2:
+        return f"{nbytes / 1024:.1f} KB"
+    return f"{nbytes / 1024 ** 2:.2f} MB"
+
+
+def run_benchmarks():
+    print(f"\n{'─' * 64}")
+    print(f"  Benchmarks — {N_INSTANCES:,} reactive instances, 10-token theme")
+    print(f"{'─' * 64}")
+
+    # ------------------------------------------------------------------
+    # Shared setup: create and wire all instances once.
+    # tracemalloc is active only during construction so the memory delta
+    # captures exactly the cost of 10 000 instances + their connections.
+    # ------------------------------------------------------------------
+    gc.collect()
+    r = _make_bench_registry()
+    BenchWidget = _make_bench_widget_class(r)
+
+    tracemalloc.start()
+    snap_before = tracemalloc.take_snapshot()
+
+    instances = [BenchWidget() for _ in range(N_INSTANCES)]
+    for w in instances:
+        w.refresh()  # first call — wires 11 connections per instance (1 settings + 10 theme)
+
+    snap_after = tracemalloc.take_snapshot()
+    tracemalloc.stop()
+
+    # ------------------------------------------------------------------
+    # 1. Memory
+    # ------------------------------------------------------------------
+    stats     = snap_after.compare_to(snap_before, "lineno")
+    net_bytes = sum(s.size_diff for s in stats if s.size_diff > 0)
+    per_inst  = net_bytes / N_INSTANCES
+
+    print(f"\n  [1/4] memory  ({N_INSTANCES:,} wired instances)")
+    print(f"    Python heap delta : {_fmt_mem(net_bytes)}")
+    print(f"    per instance      : {_fmt_mem(per_inst)}")
+    print(f"    note              : Qt C++ heap not included; actual RSS will be higher")
+
+    # ------------------------------------------------------------------
+    # 2. Settings read speed
+    #    One settings.get("value") call per instance per iteration.
+    #    No tracking context is active — pure dict lookup + _record no-op.
+    # ------------------------------------------------------------------
+    t0 = time.perf_counter()
+    for _ in range(READ_ITERATIONS):
+        for _ in instances:
+            r.settings.get("value")
+    elapsed_s = time.perf_counter() - t0
+
+    total_s_calls = N_INSTANCES * READ_ITERATIONS
+    print(f"\n  [2/4] settings read  ({N_INSTANCES:,} instances × {READ_ITERATIONS} iterations)")
+    print(f"    total calls  : {total_s_calls:,}")
+    print(f"    elapsed      : {_fmt_time(elapsed_s)}")
+    print(f"    throughput   : {total_s_calls / elapsed_s:,.0f} calls/sec")
+    print(f"    per call     : {_fmt_time(elapsed_s / total_s_calls)}")
+
+    # ------------------------------------------------------------------
+    # 3. Theme read speed
+    #    10 theme.get() calls per instance per iteration (all 10 tokens).
+    # ------------------------------------------------------------------
+    t0 = time.perf_counter()
+    for _ in range(READ_ITERATIONS):
+        for _ in instances:
+            for i in range(10):
+                r.theme.get(f"token.{i}")
+    elapsed_t = time.perf_counter() - t0
+
+    total_t_calls = N_INSTANCES * 10 * READ_ITERATIONS
+    print(f"\n  [3/4] theme read  ({N_INSTANCES:,} instances × 10 tokens × {READ_ITERATIONS} iterations)")
+    print(f"    total calls  : {total_t_calls:,}")
+    print(f"    elapsed      : {_fmt_time(elapsed_t)}")
+    print(f"    throughput   : {total_t_calls / elapsed_t:,.0f} calls/sec")
+    print(f"    per call     : {_fmt_time(elapsed_t / total_t_calls)}")
+
+    # ------------------------------------------------------------------
+    # 4. Switch speed
+    #    One set_mode() flip changes all 10 tokens → 10 × 10 000 = 100 000
+    #    signal deliveries per flip. processEvents() flushes them all.
+    #    Alternates dark→light→dark so every flip is a real diff with no
+    #    short-circuit.
+    #
+    #    One warm-up flip is performed before the timed loop to avoid
+    #    measuring first-flip Qt machinery overhead.
+    # ------------------------------------------------------------------
+    r.theme.set_mode("light")   # warm-up: dark → light
+    app.processEvents()
+
+    t0 = time.perf_counter()
+    for i in range(SWITCH_ITERATIONS):
+        r.theme.set_mode("dark" if i % 2 == 0 else "light")
+        app.processEvents()
+    elapsed_sw = time.perf_counter() - t0
+
+    deliveries_per_flip  = N_INSTANCES * 10   # 10 changed tokens × 10 000 listeners
+    total_deliveries     = deliveries_per_flip * SWITCH_ITERATIONS
+    per_switch           = elapsed_sw / SWITCH_ITERATIONS
+    delivery_rate        = total_deliveries / elapsed_sw
+
+    print(f"\n  [4/4] switch  ({SWITCH_ITERATIONS} set_mode() flips, "
+          f"{N_INSTANCES:,} instances × 10 tokens)")
+    print(f"    signal deliveries : {total_deliveries:,} total  "
+          f"({deliveries_per_flip:,} per flip)")
+    print(f"    total elapsed     : {_fmt_time(elapsed_sw)}")
+    print(f"    per flip          : {_fmt_time(per_switch)}")
+    print(f"    delivery rate     : {delivery_rate:,.0f} signals/sec")
+
+    # Release instances before exiting.
+    del instances
+    gc.collect()
+
+    print(f"\n{'─' * 64}\n")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     print(f"\nRunning {len(TESTS)} tests\n")
     for name, fn in TESTS:
@@ -598,7 +807,11 @@ if __name__ == "__main__":
         print("\nFailed tests:")
         for name in failed:
             print(f"  - {name}")
+
+    run_benchmarks()
+
+    if failed:
         sys.exit(1)
     else:
-        print("\nAll tests passed.")
+        print("All tests passed.")
         sys.exit(0)
