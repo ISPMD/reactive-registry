@@ -2,6 +2,8 @@
 
 A reactive key/value store system for PySide6 applications. Combines a **settings store** and a **theme store** under a single registry, with a `@registry.reactive` decorator that automatically re-runs methods when the values they read change.
 
+# Work in progress - 0.1
+
 ---
 
 ## Installation
