@@ -11,8 +11,7 @@ How the tracking pipeline works
    opens a tracking context (_push_tracking) before invoking the method.
 3. Every store.get() call invokes _record(store, key), appending a (store, key)
    pair to the active context. Because each store passes itself, reads from
-   registry.settings and registry.theme are collected in the same list without
-   colliding.
+   settings and theme are collected in the same list without colliding.
 4. After the method returns, ReactiveDescriptor closes the tracking context
    (_pop_tracking), deduplicates the collected pairs, and wires one Qt signal
    connection per unique (store, key) pair. Each connection re-runs the method
@@ -24,17 +23,34 @@ How the tracking pipeline works
 Tracking uses a per-thread stack (not a single slot) so that nested reactive
 calls each collect their own dependencies without interfering with each other.
 
+Two tracking modes
+------------------
+Per-instance (default):
+    Each instance gets its own connections wired on its first call. The handler
+    holds a weakref to the instance and is cleaned up by a weakref finalizer
+    when the instance is GC'd.
+
+Class-level (@registry.reactive_class on the owning class):
+    The first instance ever to call the method triggers tracking and wires one
+    Qt signal connection per unique (store, key) pair for the entire class.
+    The handler iterates a WeakSet of all living instances and calls the method
+    on each — one Qt dispatch regardless of how many instances exist.
+    Every subsequent instance simply registers itself into the class WeakSet on
+    its first call — no new tracking, no new connections.
+
 Shared internals exported to store modules
 ------------------------------------------
-    _KeySignalEmitter      — minimal QObject hosting one per-key signal;
-                             shared by SettingsModel and ThemeStore to avoid
-                             duplicating the same class in both files
-    _record(store, key)    — append (store, key) to the active tracking context;
-                             no-op outside a tracking context
-    _values_equal(a, b)    — equality that never raises and handles objects
-                             whose == returns non-bool (e.g. numpy arrays)
-    ReactiveDescriptor     — non-data descriptor returned by @registry.reactive
-    disconnect_conns       — module-level finalizer called by weakref.finalize
+    _KeySignalEmitter          — minimal QObject hosting one per-key Signal;
+                                 shared by SettingsModel and ThemeStore to avoid
+                                 duplicating the same boilerplate in both files
+    _record(store, key)        — append (store, key) to the active tracking
+                                 context; silently no-ops outside a context
+    _values_equal(a, b)        — equality that never raises and handles objects
+                                 whose == returns a non-bool (e.g. numpy arrays)
+    ReactiveDescriptor         — non-data descriptor returned by @registry.reactive
+    reactive_class_decorator   — class decorator that opts a class into class-level
+                                 tracking; apply via @registry.reactive_class
+    disconnect_conns           — module-level finalizer called by weakref.finalize
 """
 
 import threading
@@ -50,15 +66,16 @@ from PySide6.QtCore import QObject, Signal
 # ---------------------------------------------------------------------------
 
 class _KeySignalEmitter(QObject):
-    """Minimal QObject that hosts a single per-key signal.
+    """Minimal QObject that hosts a single per-key Signal.
 
     Qt signals must be class-level attributes on a QObject subclass and cannot
-    be attached to a store dynamically, so one emitter is created per key on
-    demand and parented to the store. Parenting ensures it is destroyed
-    automatically when the store is destroyed.
+    be added to a store dynamically. One emitter is created per key on demand
+    and parented to the store, so it is destroyed automatically when the store
+    is destroyed.
 
     Defined here (not in each store module) so both SettingsModel and
-    ThemeStore share one implementation with no duplication."""
+    ThemeStore share one implementation without duplication.
+    """
 
     sig = Signal(object)
 
@@ -86,7 +103,7 @@ def _push_tracking() -> None:
 
 
 def _pop_tracking() -> list:
-    """Close the innermost tracking context and return its collected deps."""
+    """Close the innermost tracking context and return its collected (store, key) deps."""
     return _TL.stack.pop()
 
 
@@ -95,8 +112,9 @@ def _record(store, key: str) -> None:
 
     Called by every store's .get() method. Silently does nothing when no
     tracking context is active (i.e. outside a @registry.reactive first call).
-    Passing `store` as the first argument lets ReactiveDescriptor later wire
-    each connection to the correct store."""
+    Passing `store` as the first argument lets ReactiveDescriptor wire each
+    connection to the correct store after the method returns.
+    """
     stack = _TL.__dict__.get("stack")
     if stack:
         stack[-1].append((store, key))
@@ -114,7 +132,8 @@ def _values_equal(a: Any, b: Any) -> bool:
       - == raising an exception (e.g. comparing a string to a QColor)
       - == returning a non-bool (e.g. numpy arrays return an element-wise array)
     In either case, conservatively returns False so the update goes through
-    and downstream listeners are notified."""
+    and downstream listeners are notified rather than silently dropped.
+    """
     if a is b:
         return True
     try:
@@ -133,96 +152,117 @@ def _values_equal(a: Any, b: Any) -> bool:
 class ReactiveDescriptor:
     """Non-data descriptor returned by @registry.reactive.
 
-    Lifecycle per instance
-    ----------------------
-    First call:
-        Runs the wrapped method inside a tracking context. Every store.get()
-        call during that run appends a (store, key) pair. After the method
-        returns, one Qt signal connection is created per unique (store, key)
-        pair. The handler re-runs the method on the same instance whenever
-        that key changes in that store.
-        A weakref finalizer is registered to disconnect all signals when the
-        instance is garbage collected — no manual cleanup is needed.
+    Supports two tracking modes, selected by whether the owning class has been
+    decorated with @registry.reactive_class.
 
-    Subsequent calls:
-        Tracking is skipped. The method runs directly. Connections wired on
-        the first call remain active and continue to trigger re-runs.
+    Per-instance mode (default)
+    ---------------------------
+    The first call on each instance runs the method inside a tracking context,
+    collects (store, key) deps, and wires one Qt signal connection per unique
+    pair. The signal handler re-runs the method on that specific instance.
+    A weakref finalizer disconnects all signals when the instance is GC'd.
 
-    Wired vs unwired state
-    ----------------------
-    _wired (WeakSet) tracks which instances have been through the first call.
-    This is explicit and unambiguous — no empty-list sentinel needed.
-    _inst_conns (WeakKeyDictionary) stores the connection list per instance
-    so disconnect_conns can clean up the right handlers on GC.
+    Subsequent calls skip tracking and run the method directly.
 
-    Reference cycle prevention
-    --------------------------
-    Signal handlers hold a weakref to the instance rather than a strong
-    reference. A strong reference would create a cycle:
-        obj → _inst_conns (value) → conns → handler → obj
-    which would prevent GC even though _inst_conns uses weak keys (weak keys
-    only weaken the key reference, not the values stored against it). With a
-    weakref in the handler, the cycle is broken and the weakref finalizer can
-    fire, disconnecting all signals cleanly.
+    Class-level mode (@registry.reactive_class on the owning class)
+    ----------------------------------------------------------------
+    The first instance ever to call the method triggers tracking and wires one
+    Qt signal connection per unique (store, key) pair for the entire class.
+    The single handler iterates a WeakSet of all living instances and calls the
+    method on each — one Qt dispatch regardless of how many instances exist.
 
-    Constraint
-    ----------
+    Every subsequent instance simply registers itself into the class WeakSet on
+    its first call — no new tracking, no new connections.
+
+    Constraint (both modes)
+    -----------------------
     All keys that should trigger re-runs must be read unconditionally on the
     first call. A key accessed only inside a branch that does not execute on
     the first call will never be tracked and will never cause a re-run.
+
+    Additional constraint (class-level mode only)
+    ---------------------------------------------
+    Tracking is done once using the first instance. All instances must read the
+    same keys unconditionally. Keys only read by later instances will never be
+    tracked.
+
+    Wired vs unwired state
+    ----------------------
+    Per-instance:  _wired (WeakSet) tracks which instances have been through
+                   the first call and had their connections wired.
+    Class-level:   _cls_wired (set of class objects) tracks which classes are
+                   already wired; _cls_instances (dict[cls, WeakSet]) holds
+                   living instances per class.
+
+    Reference cycle prevention
+    --------------------------
+    Per-instance handlers hold a weakref to the instance rather than a strong
+    reference, breaking any cycle that would prevent GC. Class-level handlers
+    iterate a WeakSet, which holds weak references to all living instances.
     """
 
     def __init__(self, fn, stores: list) -> None:
         self._fn = fn
-        # _stores is not iterated at runtime — tracking collects only stores
-        # that were actually accessed during the first call. Retained for
-        # introspection (e.g. to inspect which stores a descriptor covers).
         self._stores = stores
+
+        # Per-instance tracking state.
+        # _wired: instances that have completed their first call.
+        # _inst_conns: maps instance → list of (store, key, handler) triples
+        #              for cleanup by the weakref finalizer.
         self._wired: weakref.WeakSet = weakref.WeakSet()
         self._inst_conns: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+        # Class-level tracking state.
+        # _cls_wired: set of classes whose signal connections are already wired.
+        # _cls_instances: dict[cls, WeakSet] — living instances per class.
+        # _cls_conns: dict[cls, list] — connection list per class (for teardown).
+        self._cls_wired: set = set()
+        self._cls_instances: dict = {}
+        self._cls_conns: dict = {}
+
         wraps(fn)(self)
 
     def __get__(self, obj, objtype=None):
-        # Descriptor protocol: return self when accessed on the class,
-        # return a bound callable when accessed on an instance.
+        # Return self (the descriptor) when accessed on the class.
+        # Return a bound partial when accessed on an instance.
         if obj is None:
             return self
         return partial(self._call, obj)
 
     def _call(self, obj):
+        cls = type(obj)
+
+        # Dispatch to the appropriate tracking mode.
+        if getattr(cls, "_reactive_class", False):
+            self._call_class(obj, cls)
+            return
+
+        # --- Per-instance mode ---
+
         if obj in self._wired:
-            # Already wired from the first call — just run the method.
-            # All signal connections remain active; no re-tracking needed.
+            # Already wired — run directly, no tracking needed.
             self._fn(obj)
             return
 
-        # --- First call ---
-        # Run the method inside a tracking context. The per-thread stack keeps
-        # this safe even if a reactive method calls another reactive method.
+        # First call for this instance: run inside a tracking context to
+        # collect (store, key) dependencies, then wire signal connections.
         _push_tracking()
         try:
             self._fn(obj)
             raw_deps = _pop_tracking()
         except Exception:
-            _pop_tracking()
+            _pop_tracking()  # always clean up the stack on error
             raise
 
-        # Wire one connection per unique (store, key) pair. Deduplication
-        # ensures a key read multiple times produces only one connection.
+        # Wire one connection per unique (store, key) pair.
+        # The handler holds a weakref to the instance so it does not prevent GC.
         conns: list = []
         seen: set = set()
-        # Hold a weak reference to obj in the handler rather than a strong one.
-        # A strong reference (o=obj) would create a cycle:
-        #   obj → _inst_conns → conns → handler → obj
-        # which prevents GC even though _inst_conns is a WeakKeyDictionary
-        # (the WeakKeyDictionary only weakly references the key, not the value).
-        # With a weakref, the handler becomes a no-op once the instance is gone,
-        # and the weakref finalizer can then run and disconnect all signals.
         obj_ref = weakref.ref(obj)
         for store, key in raw_deps:
             pair = (id(store), key)
             if pair in seen:
-                continue
+                continue  # deduplicate — multiple reads of the same key
             seen.add(pair)
             def handler(_value, _ref=obj_ref, _fn=self._fn):
                 o = _ref()
@@ -234,13 +274,74 @@ class ReactiveDescriptor:
         self._wired.add(obj)
         self._inst_conns[obj] = conns
 
-        # Register a weakref finalizer to disconnect signals when the instance
-        # is GC'd. We pass list(conns) — a snapshot — because by the time the
-        # finalizer fires, _inst_conns[obj] may already be gone.
-        # Only register when at least one key was tracked; a reactive method
-        # that reads no store keys has nothing to disconnect.
+        # Register a weakref finalizer so connections are disconnected
+        # automatically when the instance is garbage collected.
         if conns:
             weakref.finalize(obj, disconnect_conns, list(conns))
+
+    def _call_class(self, obj, cls):
+        """Class-level tracking path.
+
+        First instance to call: runs the method inside a tracking context,
+        wires one connection per (store, key) pair. The handler iterates
+        _cls_instances[cls] — a WeakSet — and calls the method on every
+        living instance.
+
+        Every subsequent instance: registers into _cls_instances[cls] and runs
+        the method directly. No new tracking, no new connections.
+        """
+        # Ensure the WeakSet for this class exists before any instance is added.
+        if cls not in self._cls_instances:
+            self._cls_instances[cls] = weakref.WeakSet()
+
+        instances = self._cls_instances[cls]
+
+        if cls in self._cls_wired:
+            # Class already wired — just register this instance and run.
+            instances.add(obj)
+            self._fn(obj)
+            return
+
+        # --- First instance for this class ---
+        # Track deps by running the method inside a tracking context.
+        _push_tracking()
+        try:
+            self._fn(obj)
+            raw_deps = _pop_tracking()
+        except Exception:
+            _pop_tracking()
+            raise
+
+        # Register the first instance before wiring connections so it is
+        # already in the WeakSet if a signal fires synchronously during
+        # connect() (rare with direct connections but possible).
+        instances.add(obj)
+
+        # Wire one connection per unique (store, key) pair.
+        # The handler holds a reference to `instances` (the WeakSet) and to
+        # `self._fn` — no strong reference to any individual instance, so
+        # instances can be GC'd freely.
+        conns: list = []
+        seen: set = set()
+        for store, key in raw_deps:
+            pair = (id(store), key)
+            if pair in seen:
+                continue  # deduplicate
+            seen.add(pair)
+            def handler(_value, _instances=instances, _fn=self._fn):
+                # Snapshot the WeakSet before iterating — it may shrink mid-loop
+                # if an instance is GC'd during signal dispatch.
+                for inst in list(_instances):
+                    _fn(inst)
+            store.on(key).connect(handler)
+            conns.append((store, key, handler))
+
+        self._cls_wired.add(cls)
+        self._cls_conns[cls] = conns
+        # Class-level connections are intentionally permanent for the lifetime
+        # of the class. Classes are never GC'd in normal use, so no finalizer
+        # is registered. For explicit teardown, call disconnect_conns directly
+        # with self._cls_conns[cls].
 
 
 # ---------------------------------------------------------------------------
@@ -252,16 +353,61 @@ def disconnect_conns(conns: list) -> None:
 
     Must be a plain module-level function rather than a method so that
     weakref.finalize can hold a reference to it without indirectly keeping
-    the watched instance alive.
+    the watched instance alive (a bound method would hold a reference to self,
+    which holds _inst_conns, which holds the instance — preventing GC).
 
     The RuntimeError guard handles the edge case where a _KeySignalEmitter was
     already destroyed before the finalizer ran (e.g. the store was torn down
-    before the widget that observed it)."""
+    before the widget that observed it).
+    """
     for store, key, handler in conns:
         emitter = store._key_signals.get(key)
         if emitter:
             try:
                 emitter.sig.disconnect(handler)
             except RuntimeError:
-                pass
+                pass  # emitter already destroyed — nothing to disconnect
     conns.clear()
+
+
+# ---------------------------------------------------------------------------
+# Class decorator for class-level reactive tracking
+# ---------------------------------------------------------------------------
+
+def reactive_class_decorator(cls):
+    """Class decorator that opts a class into class-level reactive tracking.
+
+    Apply to any class that contains @registry.reactive methods. All such
+    methods will use class-level tracking: the first instance to call the
+    method triggers dependency tracking and wires one Qt signal connection per
+    (store, key) pair. Every subsequent instance simply joins the shared
+    WeakSet — no new connections are created.
+
+    When a tracked key changes, one Qt signal dispatch triggers the method on
+    every currently living instance of the class. This is more efficient than
+    per-instance tracking when many identical widget instances exist, because
+    the number of Qt connections stays constant regardless of instance count.
+
+    Usage::
+
+        @registry.reactive_class
+        class VolumeLabel(QLabel):
+
+            @registry.reactive
+            def refresh(self):
+                vol = settings.get("volume")
+                bg  = theme.get("color.background")
+                self.setText(f"Volume: {vol}")
+                self.setStyleSheet(f"background: {bg};")
+
+            def __init__(self):
+                super().__init__()
+                self.refresh()  # first instance: tracks + wires;
+                                # later instances: join WeakSet + run directly
+
+    Constraint: all instances must read the same keys unconditionally in the
+    decorated method. Keys only read by later instances will never be tracked
+    and will never trigger re-runs.
+    """
+    cls._reactive_class = True
+    return cls
