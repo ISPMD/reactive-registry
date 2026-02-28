@@ -2,9 +2,10 @@
 Registry Demo
 =============
 Shows @registry.reactive (per-instance) and @registry.reactive_class
-(class-level) side by side in a small PySide6 app.
+(class-level) side by side in a small PySide6 app, now with translations.
 
-Left  — controls: volume slider, brightness slider, dark/light toggle.
+Left  — controls: volume slider, brightness slider, dark/light toggle,
+         language selector (EN / ES / FR / RO).
 Right — two rows of reactive widgets:
           Row 1: PlayerCard  — uses @registry.reactive  (per-instance)
           Row 2: StatusBadge — uses @registry.reactive_class (class-level)
@@ -23,7 +24,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 
-from Registry import settings, theme, registry
+from Registry import settings, theme, translations, registry
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +37,7 @@ theme.register("Slate", {
         "color.surface": "#1e293b",
         "color.border":  "#475569",
         "color.text":    "#f8fafc",
-        "color.subtext": "#e2e8f0",  # strong readable secondary
+        "color.subtext": "#e2e8f0",
         "color.accent":  "#38bdf8",
     },
     "light": {
@@ -44,7 +45,7 @@ theme.register("Slate", {
         "color.surface": "#e2e8f0",
         "color.border":  "#94a3b8",
         "color.text":    "#0f172a",
-        "color.subtext": "#1e293b",  # dark enough for body text
+        "color.subtext": "#1e293b",
         "color.accent":  "#0369a1",
     },
 })
@@ -63,11 +64,10 @@ theme.register("Rose", {
         "color.surface": "#ffe4e6",
         "color.border":  "#fda4af",
         "color.text":    "#1c0f12",
-        "color.subtext": "#14070a",   # near-black wine
+        "color.subtext": "#14070a",
         "color.accent":  "#a83a4a",
     },
 })
-
 
 theme.register("Moss", {
     "dark": {
@@ -83,17 +83,144 @@ theme.register("Moss", {
         "color.surface": "#dcfce7",
         "color.border":  "#86efac",
         "color.text":    "#0b1a12",
-        "color.subtext": "#06140d",   # near-black green
+        "color.subtext": "#06140d",
         "color.accent":  "#1f7a46",
     },
 })
 
-# Seed settings with defaults
+
+# ---------------------------------------------------------------------------
+# Translation definitions
+# ---------------------------------------------------------------------------
+
+translations.register("en", {
+    "controls.heading":        "Controls",
+    "controls.volume":         "volume",
+    "controls.brightness":     "brightness",
+    "controls.mode.to_light":  "→ light mode",
+    "controls.mode.to_dark":   "→ dark mode",
+    "controls.language":       "language",
+    "card.vol":                "vol",
+    "card.bri":                "bri",
+    "badge.theme":             "theme",
+    "badge.mode":              "mode",
+    "section.per_instance":    "@registry.reactive  —  per-instance",
+    "section.per_instance.note":
+        "Each PlayerCard independently tracks its own deps. "
+        "3 cards × 8 keys = 24 signal connections total.",
+    "section.class_level":     "@registry.reactive_class  —  class-level",
+    "section.class_level.note":
+        "All StatusBadges share one set of connections for the whole class. "
+        "3 badges or 300 — still 6 signal connections total.",
+    "window.title":            "Reactive Widgets",
+    "button.settings":         "settings",
+    "dialog.title":            "Settings",
+    "dialog.theme":            "Theme",
+    "dialog.mode":             "Mode",
+    "dialog.mode.dark":        "Dark",
+    "dialog.mode.light":       "Light",
+    "dialog.done":             "Done",
+    "dialog.language":         "Language",
+})
+
+translations.register("es", {
+    "controls.heading":        "Controles",
+    "controls.volume":         "volumen",
+    "controls.brightness":     "brillo",
+    "controls.mode.to_light":  "→ modo claro",
+    "controls.mode.to_dark":   "→ modo oscuro",
+    "controls.language":       "idioma",
+    "card.vol":                "vol",
+    "card.bri":                "bri",
+    "badge.theme":             "tema",
+    "badge.mode":              "modo",
+    "section.per_instance":    "@registry.reactive  —  por instancia",
+    "section.per_instance.note":
+        "Cada PlayerCard rastrea sus propias dependencias. "
+        "3 tarjetas × 8 claves = 24 conexiones en total.",
+    "section.class_level":     "@registry.reactive_class  —  nivel de clase",
+    "section.class_level.note":
+        "Todos los StatusBadge comparten una sola conexión por clase. "
+        "3 badges o 300 — solo 6 conexiones en total.",
+    "window.title":            "Widgets Reactivos",
+    "button.settings":         "ajustes",
+    "dialog.title":            "Ajustes",
+    "dialog.theme":            "Tema",
+    "dialog.mode":             "Modo",
+    "dialog.mode.dark":        "Oscuro",
+    "dialog.mode.light":       "Claro",
+    "dialog.done":             "Listo",
+    "dialog.language":         "Idioma",
+})
+
+translations.register("ro", {
+    "controls.heading":        "Controale",
+    "controls.volume":         "volum",
+    "controls.brightness":     "luminozitate",
+    "controls.mode.to_light":  "→ mod deschis",
+    "controls.mode.to_dark":   "→ mod întunecat",
+    "controls.language":       "limbă",
+    "card.vol":                "vol",
+    "card.bri":                "lum",
+    "badge.theme":             "temă",
+    "badge.mode":              "mod",
+    "section.per_instance":    "@registry.reactive  —  per instanta",
+    "section.per_instance.note":
+        "Fiecare PlayerCard urmareste propriile dependinte. "
+        "3 carduri × 8 chei = 24 conexiuni în total.",
+    "section.class_level":     "@registry.reactive_class  —  nivel clasa",
+    "section.class_level.note":
+        "Toate StatusBadge-urile impart un singur set de conexiuni. "
+        "3 sau 300 de badge-uri — tot 6 conexiuni în total.",
+    "window.title":            "Widget-uri Reactive",
+    "button.settings":         "setări",
+    "dialog.title":            "Setări",
+    "dialog.theme":            "Temă",
+    "dialog.mode":             "Mod",
+    "dialog.mode.dark":        "Întunecat",
+    "dialog.mode.light":       "Deschis",
+    "dialog.done":             "Gata",
+    "dialog.language":         "Limbă",
+})
+
+translations.register("fr", {
+    "controls.heading":        "Contrôles",
+    "controls.volume":         "volume",
+    "controls.brightness":     "luminosité",
+    "controls.mode.to_light":  "→ mode clair",
+    "controls.mode.to_dark":   "→ mode sombre",
+    "controls.language":       "langue",
+    "card.vol":                "vol",
+    "card.bri":                "lum",
+    "badge.theme":             "thème",
+    "badge.mode":              "mode",
+    "section.per_instance":    "@registry.reactive  —  par instance",
+    "section.per_instance.note":
+        "Chaque PlayerCard suit ses propres dépendances. "
+        "3 cartes × 8 clés = 24 connexions au total.",
+    "section.class_level":     "@registry.reactive_class  —  niveau classe",
+    "section.class_level.note":
+        "Tous les StatusBadge partagent un seul ensemble de connexions. "
+        "3 badges ou 300 — seulement 6 connexions au total.",
+    "window.title":            "Widgets Réactifs",
+    "button.settings":         "réglages",
+    "dialog.title":            "Réglages",
+    "dialog.theme":            "Thème",
+    "dialog.mode":             "Mode",
+    "dialog.mode.dark":        "Sombre",
+    "dialog.mode.light":       "Clair",
+    "dialog.done":             "Terminer",
+    "dialog.language":         "Langue",
+})
+
+
+# Seed defaults
 settings.set("volume",     72)
 settings.set("brightness", 80)
 
 theme.set_theme("Slate")
 theme.set_mode("dark")
+translations.set_language("en")
 
 
 # ---------------------------------------------------------------------------
@@ -105,14 +232,15 @@ class SettingsDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Settings")
-        self.setFixedWidth(280)
+        self.setFixedWidth(300)
 
         root = QVBoxLayout(self)
         root.setSpacing(16)
         root.setContentsMargins(24, 24, 24, 24)
 
-        root.addWidget(self._heading("Theme"))
+        self._heading_lbl = QLabel()
+        self._heading_lbl.setFont(QFont("Courier New", 10, QFont.Bold))
+        root.addWidget(self._heading_lbl)
 
         self._theme_group = QButtonGroup(self)
         for i, name in enumerate(("Slate", "Rose", "Moss")):
@@ -124,11 +252,15 @@ class SettingsDialog(QDialog):
             root.addWidget(rb)
 
         root.addWidget(self._separator())
-        root.addWidget(self._heading("Mode"))
+
+        self._mode_heading_lbl = QLabel()
+        self._mode_heading_lbl.setFont(QFont("Courier New", 10, QFont.Bold))
+        root.addWidget(self._mode_heading_lbl)
 
         self._mode_group = QButtonGroup(self)
-        for i, mode_name in enumerate(("dark", "light")):
-            rb = QRadioButton(mode_name.capitalize())
+        self._dark_rb  = QRadioButton()
+        self._light_rb = QRadioButton()
+        for i, (rb, mode_name) in enumerate([(self._dark_rb, "dark"), (self._light_rb, "light")]):
             rb.setFont(QFont("Courier New", 10))
             rb.setChecked(theme.active_mode == mode_name)
             rb.toggled.connect(lambda on, m=mode_name: theme.set_mode(m) if on else None)
@@ -137,18 +269,32 @@ class SettingsDialog(QDialog):
 
         root.addStretch()
 
-        btn = QPushButton("Done")
-        btn.setFont(QFont("Courier New", 10))
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.clicked.connect(self.accept)
-        root.addWidget(btn)
+        root.addWidget(self._separator())
 
-        self.apply_style()   # first call — tracks + wires
+        self._lang_heading_lbl = QLabel()
+        self._lang_heading_lbl.setFont(QFont("Courier New", 10, QFont.Bold))
+        root.addWidget(self._lang_heading_lbl)
 
-    def _heading(self, text):
-        lbl = QLabel(text)
-        lbl.setFont(QFont("Courier New", 10, QFont.Bold))
-        return lbl
+        self._lang_group = QButtonGroup(self)
+        self._lang_rbs: dict[str, QRadioButton] = {}
+        for i, (code, label) in enumerate([("en", "EN"), ("es", "ES"), ("fr", "FR"), ("ro", "RO")]):
+            rb = QRadioButton(label)
+            rb.setFont(QFont("Courier New", 10))
+            rb.setChecked(translations.active_language == code)
+            rb.toggled.connect(lambda on, c=code: translations.set_language(c) if on else None)
+            self._lang_group.addButton(rb, i)
+            self._lang_rbs[code] = rb
+            root.addWidget(rb)
+
+        root.addStretch()
+
+        self._done_btn = QPushButton()
+        self._done_btn.setFont(QFont("Courier New", 10))
+        self._done_btn.setCursor(Qt.PointingHandCursor)
+        self._done_btn.clicked.connect(self.accept)
+        root.addWidget(self._done_btn)
+
+        self.apply_style()
 
     def _separator(self):
         line = QFrame()
@@ -163,6 +309,23 @@ class SettingsDialog(QDialog):
         text    = theme.get("color.text")
         subtext = theme.get("color.subtext")
         accent  = theme.get("color.accent")
+
+        self.setWindowTitle(translations.get("dialog.title"))
+        self._heading_lbl.setText(translations.get("dialog.theme"))
+        self._mode_heading_lbl.setText(translations.get("dialog.mode"))
+        self._dark_rb.setText(translations.get("dialog.mode.dark"))
+        self._light_rb.setText(translations.get("dialog.mode.light"))
+        self._lang_heading_lbl.setText(translations.get("dialog.language"))
+        self._done_btn.setText(translations.get("dialog.done"))
+
+        # Keep language radio buttons in sync when language is switched
+        # from the control panel while the dialog is open
+        active_lang = translations.active_language
+        for code, rb in self._lang_rbs.items():
+            rb.blockSignals(True)
+            rb.setChecked(code == active_lang)
+            rb.blockSignals(False)
+
         self.setStyleSheet(f"""
             QDialog   {{ background:{bg}; }}
             QLabel    {{ color:{text}; background:transparent; }}
@@ -191,7 +354,7 @@ class SettingsDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 class ControlPanel(QWidget):
-    """Volume slider, brightness slider, mode toggle button."""
+    """Volume slider, brightness slider, mode toggle, language selector."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -201,14 +364,17 @@ class ControlPanel(QWidget):
         root.setContentsMargins(20, 28, 20, 28)
         root.setSpacing(20)
 
-        heading = QLabel("Controls")
-        heading.setFont(QFont("Courier New", 13, QFont.Bold))
-        root.addWidget(heading)
+        self._heading_lbl = QLabel()
+        self._heading_lbl.setFont(QFont("Courier New", 13, QFont.Bold))
+        root.addWidget(self._heading_lbl)
 
         root.addWidget(self._separator())
 
         # Volume
-        root.addWidget(self._label("volume"))
+        self._vol_label = QLabel()
+        self._vol_label.setFont(QFont("Courier New", 9))
+        root.addWidget(self._vol_label)
+
         self._vol_readout = QLabel(str(settings.get("volume")))
         self._vol_readout.setFont(QFont("Courier New", 10))
         root.addWidget(self._vol_readout)
@@ -220,7 +386,10 @@ class ControlPanel(QWidget):
         root.addWidget(self._vol_slider)
 
         # Brightness
-        root.addWidget(self._label("brightness"))
+        self._bri_label = QLabel()
+        self._bri_label.setFont(QFont("Courier New", 9))
+        root.addWidget(self._bri_label)
+
         self._bri_readout = QLabel(str(settings.get("brightness")))
         self._bri_readout.setFont(QFont("Courier New", 10))
         root.addWidget(self._bri_readout)
@@ -239,14 +408,32 @@ class ControlPanel(QWidget):
         self._mode_btn.clicked.connect(theme.toggle_mode)
         root.addWidget(self._mode_btn)
 
+        root.addWidget(self._separator())
+
+        # Language selector
+        self._lang_label = QLabel()
+        self._lang_label.setFont(QFont("Courier New", 9))
+        root.addWidget(self._lang_label)
+
+        lang_row = QHBoxLayout()
+        lang_row.setSpacing(6)
+        self._lang_group = QButtonGroup(self)
+        self._lang_btns: dict[str, QPushButton] = {}
+        for i, (code, label) in enumerate([("en", "EN"), ("es", "ES"), ("fr", "FR"), ("ro", "RO")]):
+            btn = QPushButton(label)
+            btn.setFont(QFont("Courier New", 9))
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setCheckable(True)
+            btn.setChecked(translations.active_language == code)
+            btn.clicked.connect(lambda _, c=code: translations.set_language(c))
+            self._lang_group.addButton(btn, i)
+            self._lang_btns[code] = btn
+            lang_row.addWidget(btn)
+        root.addLayout(lang_row)
+
         root.addStretch()
 
-        self.apply_style()  # first call — tracks + wires
-
-    def _label(self, text):
-        lbl = QLabel(text)
-        lbl.setFont(QFont("Courier New", 9))
-        return lbl
+        self.apply_style()
 
     def _separator(self):
         line = QFrame()
@@ -270,8 +457,20 @@ class ControlPanel(QWidget):
         subtext = theme.get("color.subtext")
         accent  = theme.get("color.accent")
 
+        # Update translated labels
+        self._heading_lbl.setText(translations.get("controls.heading"))
+        self._vol_label.setText(translations.get("controls.volume"))
+        self._bri_label.setText(translations.get("controls.brightness"))
+        self._lang_label.setText(translations.get("controls.language"))
+
         mode = theme.active_mode
-        self._mode_btn.setText(f"→ {('light' if mode == 'dark' else 'dark')} mode")
+        key = "controls.mode.to_light" if mode == "dark" else "controls.mode.to_dark"
+        self._mode_btn.setText(translations.get(key))
+
+        # Highlight the active language button
+        active_lang = translations.active_language
+        for code, btn in self._lang_btns.items():
+            btn.setChecked(code == active_lang)
 
         self.setStyleSheet(f"""
             QWidget  {{ background:{bg}; color:{text}; }}
@@ -292,23 +491,19 @@ class ControlPanel(QWidget):
                 border:1px solid {border}; border-radius:6px; padding:7px;
             }}
             QPushButton:hover {{ color:{accent}; border-color:{accent}; }}
+            QPushButton:checked {{
+                background:{accent}; color:{bg};
+                border-color:{accent};
+            }}
         """)
 
 
 # ---------------------------------------------------------------------------
 # PlayerCard  — @registry.reactive  (per-instance tracking)
-#
-# Each card wires its own connections on its first refresh() call.
-# Instance A and Instance B each hold separate signal connections.
 # ---------------------------------------------------------------------------
 
 class PlayerCard(QWidget):
-    """Shows a channel name, volume bar, and brightness bar.
-
-    @registry.reactive — per-instance. Every card independently wires
-    connections to "volume", "brightness", and each theme token it reads.
-    Three cards means three times as many connections as one card.
-    """
+    """Shows a channel name, volume bar, and brightness bar."""
 
     def __init__(self, name: str, parent=None):
         super().__init__(parent)
@@ -343,7 +538,7 @@ class PlayerCard(QWidget):
         self._bri_fill.setFixedHeight(6)
         root.addWidget(self._bri_track)
 
-        self.refresh()  # first call — tracks keys, wires this instance's connections
+        self.refresh()
 
     @registry.reactive
     def refresh(self):
@@ -356,8 +551,11 @@ class PlayerCard(QWidget):
         subtext = theme.get("color.subtext")
         accent  = theme.get("color.accent")
 
-        self._vol_lbl.setText(f"vol  {vol:>3}%")
-        self._bri_lbl.setText(f"bri  {bri:>3}%")
+        vol_label = translations.get("card.vol")
+        bri_label = translations.get("card.bri")
+
+        self._vol_lbl.setText(f"{vol_label}  {vol:>3}%")
+        self._bri_lbl.setText(f"{bri_label}  {bri:>3}%")
 
         self.setStyleSheet(f"""
             QWidget {{ background:{surface}; border-radius:8px; }}
@@ -371,7 +569,6 @@ class PlayerCard(QWidget):
         self._vol_fill.setStyleSheet(f"background:{accent}; border-radius:3px;")
         self._bri_fill.setStyleSheet(f"background:{accent}; border-radius:3px;")
 
-        # Update fill widths once the widget has a real width
         self._vol = vol
         self._bri = bri
         self._vol_track.resizeEvent = lambda _: self._resize_bars()
@@ -385,20 +582,11 @@ class PlayerCard(QWidget):
 
 # ---------------------------------------------------------------------------
 # StatusBadge  — @registry.reactive_class  (class-level tracking)
-#
-# All StatusBadge instances share exactly one set of signal connections.
-# The first instance wires them; every later one just joins the WeakSet.
 # ---------------------------------------------------------------------------
 
 @registry.reactive_class
 class StatusBadge(QWidget):
-    """Shows the active theme name, mode, and accent swatch.
-
-    @registry.reactive_class — class-level. No matter how many StatusBadge
-    instances exist, there are only as many signal connections as there are
-    unique (store, key) pairs read in refresh(). One dispatch re-runs refresh()
-    on every living instance at once.
-    """
+    """Shows the active theme name, mode, and accent swatch."""
 
     def __init__(self, label: str, parent=None):
         super().__init__(parent)
@@ -425,7 +613,7 @@ class StatusBadge(QWidget):
         self._swatch.setFixedHeight(16)
         root.addWidget(self._swatch)
 
-        self.refresh()  # first instance: tracks + wires; others: join WeakSet + run
+        self.refresh()
 
     @registry.reactive
     def refresh(self):
@@ -436,8 +624,11 @@ class StatusBadge(QWidget):
         subtext = theme.get("color.subtext")
         accent  = theme.get("color.accent")
 
-        self._theme_lbl.setText(f"theme  {theme.active_theme}")
-        self._mode_lbl.setText(f"mode   {theme.active_mode}")
+        theme_label = translations.get("badge.theme")
+        mode_label  = translations.get("badge.mode")
+
+        self._theme_lbl.setText(f"{theme_label}  {theme.active_theme}")
+        self._mode_lbl.setText(f"{mode_label}   {theme.active_mode}")
 
         self.setStyleSheet(f"""
             QWidget {{ background:{surface}; border-radius:8px; }}
@@ -457,61 +648,50 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Registry Demo")
         self.setMinimumSize(860, 500)
 
-        # ── root split ──────────────────────────────────────────────────────
         root_w = QWidget()
         self.setCentralWidget(root_w)
         root_h = QHBoxLayout(root_w)
         root_h.setContentsMargins(0, 0, 0, 0)
         root_h.setSpacing(0)
 
-        # Left panel
         self.controls = ControlPanel()
         root_h.addWidget(self.controls)
 
-        # Divider
         div = QFrame()
         div.setFrameShape(QFrame.VLine)
         root_h.addWidget(div)
 
-        # Right panel
         right_w = QWidget()
         right_v = QVBoxLayout(right_w)
         right_v.setContentsMargins(28, 24, 28, 24)
         right_v.setSpacing(20)
         root_h.addWidget(right_w, stretch=1)
 
-        # ── top bar ─────────────────────────────────────────────────────────
+        # Top bar
         top = QHBoxLayout()
-        top.setSpacing(0)
-
-        title = QLabel("Reactive Widgets")
-        title.setFont(QFont("Courier New", 13, QFont.Bold))
-        top.addWidget(title)
+        self._title_lbl = QLabel()
+        self._title_lbl.setFont(QFont("Courier New", 13, QFont.Bold))
+        top.addWidget(self._title_lbl)
         top.addStretch()
 
-        self._settings_btn = QPushButton("settings")
+        self._settings_btn = QPushButton()
         self._settings_btn.setFont(QFont("Courier New", 9))
         self._settings_btn.setCursor(Qt.PointingHandCursor)
         self._settings_btn.clicked.connect(self._open_settings)
         top.addWidget(self._settings_btn)
-
         right_v.addLayout(top)
 
-        # ── per-instance section ─────────────────────────────────────────────
-        pi_tag = QLabel("@registry.reactive  —  per-instance")
-        pi_tag.setFont(QFont("Courier New", 8))
-        right_v.addWidget(pi_tag)
+        # Per-instance section
+        self._pi_tag  = QLabel()
+        self._pi_tag.setFont(QFont("Courier New", 8))
+        right_v.addWidget(self._pi_tag)
 
-        pi_note = QLabel(
-            "Each PlayerCard independently tracks its own deps. "
-            "3 cards × 8 keys = 24 signal connections total."
-        )
-        pi_note.setFont(QFont("Courier New", 8))
-        pi_note.setWordWrap(True)
-        right_v.addWidget(pi_note)
+        self._pi_note = QLabel()
+        self._pi_note.setFont(QFont("Courier New", 8))
+        self._pi_note.setWordWrap(True)
+        right_v.addWidget(self._pi_note)
 
         pi_row = QHBoxLayout()
         pi_row.setSpacing(12)
@@ -522,23 +702,19 @@ class MainWindow(QMainWindow):
         pi_row.addStretch()
         right_v.addLayout(pi_row)
 
-        # ── separator ───────────────────────────────────────────────────────
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         right_v.addWidget(sep)
 
-        # ── class-level section ──────────────────────────────────────────────
-        cl_tag = QLabel("@registry.reactive_class  —  class-level")
-        cl_tag.setFont(QFont("Courier New", 8))
-        right_v.addWidget(cl_tag)
+        # Class-level section
+        self._cl_tag  = QLabel()
+        self._cl_tag.setFont(QFont("Courier New", 8))
+        right_v.addWidget(self._cl_tag)
 
-        cl_note = QLabel(
-            "All StatusBadges share one set of connections for the whole class. "
-            "3 badges or 300 — still 6 signal connections total."
-        )
-        cl_note.setFont(QFont("Courier New", 8))
-        cl_note.setWordWrap(True)
-        right_v.addWidget(cl_note)
+        self._cl_note = QLabel()
+        self._cl_note.setFont(QFont("Courier New", 8))
+        self._cl_note.setWordWrap(True)
+        right_v.addWidget(self._cl_note)
 
         cl_row = QHBoxLayout()
         cl_row.setSpacing(12)
@@ -551,18 +727,27 @@ class MainWindow(QMainWindow):
 
         right_v.addStretch()
 
-        self.apply_style()  # first call — tracks + wires
+        self.apply_style()
 
     def _open_settings(self):
         SettingsDialog(self).exec()
 
     @registry.reactive
     def apply_style(self):
-        bg     = theme.get("color.bg")
-        border = theme.get("color.border")
-        text   = theme.get("color.text")
+        bg      = theme.get("color.bg")
+        border  = theme.get("color.border")
+        text    = theme.get("color.text")
         subtext = theme.get("color.subtext")
         accent  = theme.get("color.accent")
+
+        self.setWindowTitle(translations.get("window.title"))
+        self._title_lbl.setText(translations.get("window.title"))
+        self._settings_btn.setText(translations.get("button.settings"))
+        self._pi_tag.setText(translations.get("section.per_instance"))
+        self._pi_note.setText(translations.get("section.per_instance.note"))
+        self._cl_tag.setText(translations.get("section.class_level"))
+        self._cl_note.setText(translations.get("section.class_level.note"))
+
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{ background:{bg}; color:{text}; }}
             QLabel  {{ color:{subtext}; background:transparent; }}

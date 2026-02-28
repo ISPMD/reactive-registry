@@ -10,25 +10,30 @@ Usage
 Runs all unit tests first, then two benchmark suites:
 
   1. Registry benchmarks  — real Registry + real PySide6 signals. Measures
-     memory, settings read throughput, theme read throughput, and theme-switch
-     signal fan-out across 10 000 wired instances using @registry.reactive
-     (per-instance tracking).
+     memory, settings read throughput, theme read throughput, translation read
+     throughput, and theme-switch / language-switch signal fan-out across
+     10 000 wired instances using @registry.reactive (per-instance tracking).
 
   2. Comparison benchmark — real Registry + real PySide6 signals. Directly
      compares @registry.reactive (per-instance tracking) against
      @registry.reactive_class (class-level tracking) on wiring time, dispatch
      time, GC cleanup time, and live memory. Both modes use QObject-based
-     widgets and real SettingsModel stores so numbers are directly comparable
-     and reflect what you would actually pay in a PySide6 application.
+     widgets and real stores so numbers are directly comparable and reflect
+     what you would actually pay in a PySide6 application.
 
 Covers
 ------
-    SettingsModel  — get, set, on, changed, as_dict, load_dict, None policy
-    ThemeStore     — register, unregister, set_theme, set_mode, toggle_mode,
-                     get, on, changed, theme_changed, as_dict, active_theme,
-                     active_mode, None policy, state-before-signals ordering
-    @registry.reactive — dependency tracking, auto re-run, multi-store,
-                         deduplication, GC cleanup
+    SettingsModel    — get, set, on, changed, as_dict, load_dict, None policy
+    ThemeStore       — register, unregister, set_theme, set_mode, toggle_mode,
+                       get, on, changed, theme_changed, as_dict, active_theme,
+                       active_mode, None policy, state-before-signals ordering
+    TranslationStore — register, unregister, set_language, get, fallback,
+                       interpolation, as_dict, active_language, None policy,
+                       language_changed signal
+    @registry.reactive       — dependency tracking, auto re-run, multi-store
+                               (settings + theme + translations), deduplication,
+                               GC cleanup, one-connection-per-language semantics
+    @registry.reactive_class — class-level equivalents of the above
 """
 
 import sys
@@ -47,6 +52,7 @@ app = QApplication.instance() or QApplication(sys.argv)
 from Registry import settings, theme, registry
 from Registry.Settings import SettingsModel
 from Registry.Theme import ThemeStore
+from Registry.Translation import TranslationStore
 from Registry.Reactive import ReactiveDescriptor, reactive_class_decorator
 
 
@@ -64,6 +70,11 @@ def make_theme():
     return ThemeStore()
 
 
+def make_translations():
+    """Return a fresh TranslationStore (no active language)."""
+    return TranslationStore()
+
+
 DARK_LIGHT = {
     "dark":  {"color.bg": "#000", "color.fg": "#fff", "font.size": 14},
     "light": {"color.bg": "#fff", "color.fg": "#000", "font.size": 14},
@@ -73,6 +84,9 @@ SECOND_THEME = {
     "dark":  {"color.bg": "#111", "color.fg": "#eee", "font.size": 16},
     "light": {"color.bg": "#eee", "color.fg": "#111", "font.size": 16},
 }
+
+EN_PACK = {"greeting": "Hello", "farewell": "Goodbye", "welcome": "Hello, {name}!"}
+ES_PACK = {"greeting": "Hola",  "farewell": "Adiós",   "welcome": "Hola, {name}!"}
 
 passed = []
 failed = []
@@ -407,21 +421,183 @@ def test_theme_register_replaces_active():
 
 
 # ===========================================================================
+# TranslationStore tests
+# ===========================================================================
+
+def test_translations_get_returns_value():
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.set_language("en")
+    assert tr.get("greeting") == "Hello"
+
+def test_translations_get_missing_key_returns_key():
+    """Missing key with no custom fallback returns the key itself."""
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.set_language("en")
+    assert tr.get("no.such.key") == "no.such.key"
+
+def test_translations_get_missing_key_custom_fallback():
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.set_language("en")
+    assert tr.get("missing", fallback="???") == "???"
+
+def test_translations_get_empty_string_fallback():
+    """An explicit empty-string fallback must be returned, not the key."""
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.set_language("en")
+    assert tr.get("missing", fallback="") == ""
+
+def test_translations_get_interpolation():
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.set_language("en")
+    assert tr.get("welcome", name="Alice") == "Hello, Alice!"
+
+def test_translations_get_interpolation_bad_key_returns_raw():
+    """A format call with wrong kwargs must return the raw string, not raise."""
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.set_language("en")
+    result = tr.get("welcome", wrong_kwarg="x")
+    assert result == "Hello, {name}!"
+
+def test_translations_active_language():
+    tr = make_translations()
+    assert tr.active_language is None
+    tr.register("en", EN_PACK)
+    tr.set_language("en")
+    assert tr.active_language == "en"
+
+def test_translations_set_language_switches_pack():
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.register("es", ES_PACK)
+    tr.set_language("en")
+    assert tr.get("greeting") == "Hello"
+    tr.set_language("es")
+    assert tr.get("greeting") == "Hola"
+
+def test_translations_as_dict_returns_snapshot():
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.set_language("en")
+    d = tr.as_dict()
+    assert d["greeting"] == "Hello"
+    d["greeting"] = "tampered"  # mutation must not affect the store
+    assert tr.get("greeting") == "Hello"
+
+def test_translations_language_changed_signal():
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.register("es", ES_PACK)
+    tr.set_language("en")
+    received = []
+    tr.language_changed.connect(lambda lang: received.append(lang))
+    tr.set_language("es")
+    app.processEvents()
+    assert received == ["es"]
+
+def test_translations_language_changed_state_committed_before_signal():
+    """The language_changed handler must see the new language and new strings."""
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.register("es", ES_PACK)
+    tr.set_language("en")
+    seen = []
+    tr.language_changed.connect(lambda lang: seen.append((lang, tr.get("greeting"))))
+    tr.set_language("es")
+    app.processEvents()
+    assert seen == [("es", "Hola")]
+
+def test_translations_none_value_raises():
+    tr = make_translations()
+    try:
+        tr.register("bad", {"greeting": None})
+        assert False, "Expected ValueError"
+    except ValueError:
+        pass
+
+def test_translations_set_language_unknown_raises():
+    tr = make_translations()
+    try:
+        tr.set_language("xx")
+        assert False, "Expected KeyError"
+    except KeyError:
+        pass
+
+def test_translations_unregister():
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.register("es", ES_PACK)
+    tr.set_language("en")
+    tr.unregister("es")
+    try:
+        tr.set_language("es")
+        assert False, "Expected KeyError"
+    except KeyError:
+        pass
+
+def test_translations_unregister_active_raises():
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.set_language("en")
+    try:
+        tr.unregister("en")
+        assert False, "Expected RuntimeError"
+    except RuntimeError:
+        pass
+
+def test_translations_unregister_unknown_raises():
+    tr = make_translations()
+    try:
+        tr.unregister("xx")
+        assert False, "Expected KeyError"
+    except KeyError:
+        pass
+
+def test_translations_register_replaces_active():
+    """Re-registering the active language must refresh live tokens immediately."""
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.set_language("en")
+    updated = {**EN_PACK, "greeting": "Hey"}
+    tr.register("en", updated)
+    assert tr.get("greeting") == "Hey"
+
+def test_translations_register_replaces_inactive_no_effect():
+    """Re-registering an inactive language must not change the active tokens."""
+    tr = make_translations()
+    tr.register("en", EN_PACK)
+    tr.register("es", ES_PACK)
+    tr.set_language("en")
+    tr.register("es", {**ES_PACK, "greeting": "Buenos días"})
+    assert tr.get("greeting") == "Hello"  # en still active, unchanged
+
+
+# ===========================================================================
 # @registry.reactive tests
 # ===========================================================================
 
 def _make_local_registry():
-    """Return a fresh Registry with its own SettingsModel and ThemeStore."""
+    """Return a fresh Registry with its own SettingsModel, ThemeStore, and
+    TranslationStore pre-loaded with test data."""
     from Registry.Registry import Registry as _Registry
     r = _Registry()
     r.settings.set("volume", 50)
     r.theme.register("base", DARK_LIGHT)
     r.theme.set_theme("base")
+    r.translations.register("en", EN_PACK)
+    r.translations.register("es", ES_PACK)
+    r.translations.set_language("en")
     return r
 
 
 def _make_fake_widget(r):
-    """Return a _FakeWidget class bound to the given registry instance."""
+    """Return a _FakeWidget class bound to the given registry instance.
+    Reads from all three stores so all three are covered by tracking."""
 
     class _FakeWidget(QObject):
         def __init__(self):
@@ -430,9 +606,10 @@ def _make_fake_widget(r):
 
         @r.reactive
         def refresh(self):
-            vol = r.settings.get("volume")
-            bg  = r.theme.get("color.bg")
-            self.calls.append((vol, bg))
+            vol      = r.settings.get("volume")
+            bg       = r.theme.get("color.bg")
+            greeting = r.translations.get("greeting")
+            self.calls.append((vol, bg, greeting))
 
     return _FakeWidget
 
@@ -464,7 +641,19 @@ def test_reactive_reruns_on_theme_change():
     assert len(w.calls) == 2
     assert w.calls[-1][1] == "#fff"
 
-def test_reactive_tracks_both_stores():
+def test_reactive_reruns_on_language_change():
+    """A language switch must trigger a re-run; the new greeting must be visible."""
+    r = _make_local_registry()
+    W = _make_fake_widget(r)
+    w = W()
+    w.refresh()
+    r.translations.set_language("es")
+    app.processEvents()
+    assert len(w.calls) == 2
+    assert w.calls[-1][2] == "Hola"
+
+def test_reactive_tracks_all_three_stores():
+    """A change in any of the three stores must independently trigger a re-run."""
     r = _make_local_registry()
     W = _make_fake_widget(r)
     w = W()
@@ -473,7 +662,34 @@ def test_reactive_tracks_both_stores():
     app.processEvents()
     r.theme.set_mode("light")
     app.processEvents()
-    assert len(w.calls) == 3
+    r.translations.set_language("es")
+    app.processEvents()
+    assert len(w.calls) == 4
+
+def test_reactive_language_single_connection_regardless_of_keys_read():
+    """Reading multiple translation keys must wire exactly one connection to
+    the TranslationStore, not one per key. A language switch must trigger one
+    re-run, not multiple."""
+    r = _make_local_registry()
+    calls = []
+
+    class W(QObject):
+        def __init__(self):
+            super().__init__()
+
+        @r.reactive
+        def refresh(self):
+            # Reads three translation keys — must still produce one connection.
+            r.translations.get("greeting")
+            r.translations.get("farewell")
+            r.translations.get("welcome")
+            calls.append(1)
+
+    w = W()
+    w.refresh()
+    r.translations.set_language("es")
+    app.processEvents()
+    assert len(calls) == 2  # initial run + exactly one re-run
 
 def test_reactive_no_duplicate_connections():
     """A key read multiple times on the first call must produce only one connection."""
@@ -510,7 +726,8 @@ def test_reactive_subsequent_calls_do_not_rewire():
     assert len(w.calls) == 4  # signal fired exactly once, not multiple times
 
 def test_reactive_gc_disconnects():
-    """All signal connections must be cleaned up when the instance is GC'd."""
+    """All signal connections (including the translation connection) must be
+    cleaned up when the instance is GC'd."""
     r = _make_local_registry()
     calls = []
 
@@ -521,18 +738,21 @@ def test_reactive_gc_disconnects():
         @r.reactive
         def refresh(self):
             _ = r.settings.get("volume")
+            _ = r.translations.get("greeting")
             calls.append(1)
 
     w = W()
-    w.refresh()  # first call — wires connections
+    w.refresh()
     assert len(calls) == 1
 
-    # Verify the connection is live before GC.
+    # Verify both connections are live before GC.
     r.settings.set("volume", 1)
     app.processEvents()
-    assert len(calls) == 2, "Connection was not wired — re-run did not happen before GC"
+    assert len(calls) == 2, "settings connection not wired"
+    r.translations.set_language("es")
+    app.processEvents()
+    assert len(calls) == 3, "translation connection not wired"
 
-    # Drop the instance and force collection.
     ref = weakref.ref(w)
     del w
     for _ in range(3):
@@ -540,24 +760,17 @@ def test_reactive_gc_disconnects():
 
     assert ref() is None, "Instance was not garbage collected"
 
-    # Connection must now be dead — a further change must not trigger a re-run.
     before = len(calls)
     r.settings.set("volume", 2)
+    app.processEvents()
+    r.translations.set_language("en")
     app.processEvents()
     assert len(calls) == before, (
         f"Handler still connected after GC: calls grew from {before} to {len(calls)}"
     )
 
-
-
-# ===========================================================================
-# @registry.reactive — additional tests
-# ===========================================================================
-
 def test_reactive_instance_isolation():
-    """Two instances of the same class must have independent connections.
-    A change triggers a re-run on the instance that tracks the key, not
-    on unrelated instances sharing the same class."""
+    """Two instances of the same class must have independent connections."""
     r = _make_local_registry()
 
     class W(QObject):
@@ -568,6 +781,7 @@ def test_reactive_instance_isolation():
         @r.reactive
         def refresh(self):
             _ = r.settings.get("volume")
+            _ = r.translations.get("greeting")
             self.calls.append(1)
 
     w1 = W(); w1.refresh()
@@ -575,18 +789,13 @@ def test_reactive_instance_isolation():
 
     r.settings.set("volume", 99)
     app.processEvents()
-
-    # Both instances are independently wired — each must re-run exactly once.
     assert len(w1.calls) == 2, f"w1 expected 2 calls, got {len(w1.calls)}"
     assert len(w2.calls) == 2, f"w2 expected 2 calls, got {len(w2.calls)}"
 
-
 def test_reactive_exception_does_not_leave_partial_wiring():
-    """If the method raises on its first call, no connections must be wired
-    and the instance must not appear in _wired. A subsequent successful call
-    must track and wire normally."""
+    """If the method raises on its first call, no connections must be wired."""
     r = _make_local_registry()
-    bomb = [True]  # flip to False to make the method succeed
+    bomb = [True]
 
     class W(QObject):
         def __init__(self):
@@ -596,37 +805,31 @@ def test_reactive_exception_does_not_leave_partial_wiring():
         @r.reactive
         def refresh(self):
             _ = r.settings.get("volume")
+            _ = r.translations.get("greeting")
             if bomb[0]:
                 raise RuntimeError("intentional")
             self.calls.append(1)
 
     w = W()
-
-    # First call raises — must propagate and leave no wiring.
     try:
         w.refresh()
         assert False, "Expected RuntimeError"
     except RuntimeError:
         pass
 
-    # Instance must not be marked as wired.
     descriptor = W.__dict__["refresh"]
     assert w not in descriptor._wired, "Instance incorrectly marked wired after exception"
 
-    # Second call succeeds — must now track and wire.
     bomb[0] = False
     w.refresh()
     assert len(w.calls) == 1
 
-    # Connection must be live.
     r.settings.set("volume", 99)
     app.processEvents()
     assert len(w.calls) == 2
 
-
 def test_reactive_zero_keys_no_crash():
-    """A reactive method that reads no store keys must run without error
-    and must not register a finalizer or leave any wiring state."""
+    """A reactive method that reads no store keys must run without error."""
     r = _make_local_registry()
     calls = []
 
@@ -636,24 +839,21 @@ def test_reactive_zero_keys_no_crash():
 
         @r.reactive
         def refresh(self):
-            # Reads no keys — nothing to track, nothing to wire.
             calls.append(1)
 
     w = W()
-    w.refresh()   # first call — no keys tracked, no connections wired
-    w.refresh()   # second call — runs directly, still no wiring
+    w.refresh()
+    w.refresh()
     assert len(calls) == 2
 
-    # No signal change should trigger a re-run since no keys were tracked.
     r.settings.set("volume", 99)
+    r.translations.set_language("es")
     app.processEvents()
     assert len(calls) == 2
 
-
 def test_reactive_nested_calls_stack_safety():
     """A reactive method that calls another reactive method must track deps
-    independently — the inner call must not pollute the outer call's dep list
-    and each method must wire only the keys it actually reads."""
+    independently — the inner call must not pollute the outer call's dep list."""
     r = _make_local_registry()
 
     class W(QObject):
@@ -664,33 +864,33 @@ def test_reactive_nested_calls_stack_safety():
 
         @r.reactive
         def inner(self):
-            # Reads only "color.bg" from theme.
             _ = r.theme.get("color.bg")
+            _ = r.translations.get("greeting")
             self.inner_calls.append(1)
 
         @r.reactive
         def outer(self):
-            # Reads only "volume" from settings, then calls inner().
             _ = r.settings.get("volume")
-            self.inner()   # nested reactive call — must not mix dep lists
+            self.inner()
             self.outer_calls.append(1)
 
     w = W()
-    w.outer()   # wires outer to "volume"; inner wires to "color.bg"
+    w.outer()
 
-    # Only a volume change should re-trigger outer.
+    # Volume change: outer re-runs (calls inner as part of body, which is fine).
     r.settings.set("volume", 99)
     app.processEvents()
     assert len(w.outer_calls) == 2, "outer did not re-run on volume change"
 
-    # A theme change must re-trigger inner (via its own connection) but must
-    # NOT re-trigger outer (outer does not track "color.bg").
+    # Theme / language change: inner re-runs via its own connection; outer must NOT.
     before_outer = len(w.outer_calls)
     r.theme.set_mode("light")
     app.processEvents()
-    assert len(w.inner_calls) >= 2, "inner did not re-run on theme change"
+    r.translations.set_language("es")
+    app.processEvents()
+    assert len(w.inner_calls) >= 3, "inner did not re-run on theme/language change"
     assert len(w.outer_calls) == before_outer, (
-        "outer incorrectly re-ran on theme change — dep lists were mixed"
+        "outer incorrectly re-ran on theme/language change — dep lists were mixed"
     )
 
 
@@ -699,18 +899,21 @@ def test_reactive_nested_calls_stack_safety():
 # ===========================================================================
 
 def _make_class_registry():
-    """Fresh Registry pre-loaded with a theme and a settings key, used by
-    all @registry.reactive_class tests."""
+    """Fresh Registry pre-loaded with a theme, a settings key, and translations."""
     from Registry.Registry import Registry as _Registry
     r = _Registry()
     r.settings.set("volume", 50)
     r.theme.register("base", DARK_LIGHT)
     r.theme.set_theme("base")
+    r.translations.register("en", EN_PACK)
+    r.translations.register("es", ES_PACK)
+    r.translations.set_language("en")
     return r
 
 
 def _make_class_widget(r):
-    """Return a @registry.reactive_class QObject widget bound to r."""
+    """Return a @registry.reactive_class QObject widget that reads from all
+    three stores."""
 
     @r.reactive_class
     class W(QObject):
@@ -720,119 +923,124 @@ def _make_class_widget(r):
 
         @r.reactive
         def refresh(self):
-            vol = r.settings.get("volume")
-            bg  = r.theme.get("color.bg")
-            self.calls.append((vol, bg))
+            vol      = r.settings.get("volume")
+            bg       = r.theme.get("color.bg")
+            greeting = r.translations.get("greeting")
+            self.calls.append((vol, bg, greeting))
 
     return W
 
 
 def test_reactive_class_first_instance_tracks_and_wires():
-    """The first instance to call a class-level reactive method must trigger
-    dependency tracking and wire one connection per (store, key) pair."""
     r = _make_class_registry()
     W = _make_class_widget(r)
     w = W()
-    w.refresh()   # first call — must track "volume" and "color.bg"
-
+    w.refresh()
     assert len(w.calls) == 1
-
-    # Verify connections are live by triggering a re-run.
     r.settings.set("volume", 99)
     app.processEvents()
     assert len(w.calls) == 2
     assert w.calls[-1][0] == 99
 
-
 def test_reactive_class_second_instance_does_not_rewire():
-    """The second instance must join the existing WeakSet without triggering
-    a new tracking pass or creating new signal connections."""
     r = _make_class_registry()
     W = _make_class_widget(r)
-
-    w1 = W(); w1.refresh()   # first instance — tracks + wires
-    w2 = W(); w2.refresh()   # second instance — join only, no new connections
-
-    # Confirm both instances received their initial refresh call.
+    w1 = W(); w1.refresh()
+    w2 = W(); w2.refresh()
     assert len(w1.calls) == 1
     assert len(w2.calls) == 1
-
-    # A single signal dispatch must re-run both instances.
     r.settings.set("volume", 77)
     app.processEvents()
     assert len(w1.calls) == 2
     assert len(w2.calls) == 2
 
-
 def test_reactive_class_all_instances_rerun_on_dispatch():
-    """When a tracked key changes, every living instance must re-run exactly once."""
     r = _make_class_registry()
     W = _make_class_widget(r)
-
     instances = [W() for _ in range(5)]
     for w in instances:
         w.refresh()
-
     r.settings.set("volume", 42)
     app.processEvents()
-
     for i, w in enumerate(instances):
         assert len(w.calls) == 2, (
             f"instance {i} expected 2 calls after dispatch, got {len(w.calls)}"
         )
 
-
-def test_reactive_class_gcd_instance_skipped_on_dispatch():
-    """An instance that has been GC'd must be silently skipped when a tracked
-    key changes — the surviving instances must still re-run."""
+def test_reactive_class_reruns_on_language_change():
+    """A language switch must trigger a re-run on all living class-level instances."""
     r = _make_class_registry()
     W = _make_class_widget(r)
+    instances = [W() for _ in range(3)]
+    for w in instances:
+        w.refresh()
+    r.translations.set_language("es")
+    app.processEvents()
+    for i, w in enumerate(instances):
+        assert len(w.calls) == 2, (
+            f"instance {i} expected 2 calls after language switch, got {len(w.calls)}"
+        )
+        assert w.calls[-1][2] == "Hola", (
+            f"instance {i} did not see updated greeting"
+        )
 
+def test_reactive_class_language_single_connection():
+    """Class-level tracking must wire exactly one connection to the
+    TranslationStore regardless of how many translation keys are read or
+    how many instances exist."""
+    r = _make_class_registry()
+    calls = []
+
+    @r.reactive_class
+    class W(QObject):
+        def __init__(self):
+            super().__init__()
+
+        @r.reactive
+        def refresh(self):
+            r.translations.get("greeting")
+            r.translations.get("farewell")
+            r.translations.get("welcome")
+            calls.append(1)
+
+    instances = [W() for _ in range(5)]
+    for w in instances:
+        w.refresh()
+
+    r.translations.set_language("es")
+    app.processEvents()
+
+    # Each instance must have re-run exactly once — 5 initial + 5 re-runs.
+    assert len(calls) == 10
+
+def test_reactive_class_gcd_instance_skipped_on_dispatch():
+    r = _make_class_registry()
+    W = _make_class_widget(r)
     w1 = W(); w1.refresh()
     w2 = W(); w2.refresh()
-
-    # Drop w1 and force GC — it should fall out of the WeakSet.
     ref = weakref.ref(w1)
     del w1
     for _ in range(3):
         gc.collect()
     assert ref() is None, "w1 was not garbage collected"
-
-    # w2 must still re-run cleanly; no crash from the dead w1.
     r.settings.set("volume", 11)
     app.processEvents()
     assert len(w2.calls) == 2
 
-
 def test_reactive_class_connections_persist_after_all_instances_gcd():
-    """Class-level connections are permanent — they must survive even after
-    all instances have been GC'd. A new instance created afterwards must
-    immediately benefit from the existing wiring without triggering
-    re-tracking or creating duplicate connections."""
     r = _make_class_registry()
     W = _make_class_widget(r)
-
     w1 = W(); w1.refresh()
-
-    # GC the only instance.
     del w1
     for _ in range(3):
         gc.collect()
-
-    # Class is still wired. Create a new instance — it must join the WeakSet
-    # and react to changes without any new tracking pass.
     w2 = W(); w2.refresh()
     assert len(w2.calls) == 1
-
-    r.settings.set("volume", 55)
+    r.translations.set_language("es")
     app.processEvents()
     assert len(w2.calls) == 2
 
-
 def test_reactive_class_multiple_methods_wire_independently():
-    """Two @registry.reactive methods on the same @registry.reactive_class
-    must each track their own keys independently — a change to a key read
-    only by method A must not trigger method B."""
     r = _make_class_registry()
 
     @r.reactive_class
@@ -841,39 +1049,48 @@ def test_reactive_class_multiple_methods_wire_independently():
             super().__init__()
             self.a_calls = []
             self.b_calls = []
+            self.c_calls = []
 
         @r.reactive
         def method_a(self):
-            # Reads only "volume".
             _ = r.settings.get("volume")
             self.a_calls.append(1)
 
         @r.reactive
         def method_b(self):
-            # Reads only "color.bg".
             _ = r.theme.get("color.bg")
             self.b_calls.append(1)
 
-    w = W()
-    w.method_a()
-    w.method_b()
+        @r.reactive
+        def method_c(self):
+            _ = r.translations.get("greeting")
+            self.c_calls.append(1)
 
-    # Volume change must trigger method_a only.
+    w = W()
+    w.method_a(); w.method_b(); w.method_c()
+
+    # Volume → method_a only
     r.settings.set("volume", 99)
     app.processEvents()
-    assert len(w.a_calls) == 2, "method_a did not re-run on volume change"
-    assert len(w.b_calls) == 1, "method_b incorrectly re-ran on volume change"
+    assert len(w.a_calls) == 2
+    assert len(w.b_calls) == 1
+    assert len(w.c_calls) == 1
 
-    # Theme change must trigger method_b only.
+    # Theme → method_b only
     r.theme.set_mode("light")
     app.processEvents()
-    assert len(w.b_calls) == 2, "method_b did not re-run on theme change"
-    assert len(w.a_calls) == 2, "method_a incorrectly re-ran on theme change"
+    assert len(w.b_calls) == 2
+    assert len(w.a_calls) == 2
+    assert len(w.c_calls) == 1
 
+    # Language → method_c only
+    r.translations.set_language("es")
+    app.processEvents()
+    assert len(w.c_calls) == 2
+    assert len(w.a_calls) == 2
+    assert len(w.b_calls) == 2
 
 def test_reactive_class_does_not_affect_other_classes():
-    """@registry.reactive_class on one class must have no effect on a plain
-    @registry.reactive class. The two must behave independently."""
     r = _make_class_registry()
 
     @r.reactive_class
@@ -885,6 +1102,7 @@ def test_reactive_class_does_not_affect_other_classes():
         @r.reactive
         def refresh(self):
             _ = r.settings.get("volume")
+            _ = r.translations.get("greeting")
             self.calls.append(1)
 
     class InstanceWidget(QObject):
@@ -895,23 +1113,18 @@ def test_reactive_class_does_not_affect_other_classes():
         @r.reactive
         def refresh(self):
             _ = r.settings.get("volume")
+            _ = r.translations.get("greeting")
             self.calls.append(1)
 
     cw = ClassWidget();    cw.refresh()
     iw = InstanceWidget(); iw.refresh()
 
-    r.settings.set("volume", 77)
+    r.translations.set_language("es")
     app.processEvents()
-
-    # Both must re-run — each via their own independent mechanism.
-    assert len(cw.calls) == 2, "ClassWidget did not re-run"
-    assert len(iw.calls) == 2, "InstanceWidget did not re-run"
-
+    assert len(cw.calls) == 2, "ClassWidget did not re-run on language change"
+    assert len(iw.calls) == 2, "InstanceWidget did not re-run on language change"
 
 def test_reactive_class_exception_does_not_corrupt_wiring():
-    """If the method raises on the very first instance call, the class must
-    not be marked as wired. A subsequent successful call on any instance
-    must perform tracking and wire connections normally."""
     r = _make_class_registry()
     bomb = [True]
 
@@ -924,6 +1137,7 @@ def test_reactive_class_exception_does_not_corrupt_wiring():
         @r.reactive
         def refresh(self):
             _ = r.settings.get("volume")
+            _ = r.translations.get("greeting")
             if bomb[0]:
                 raise RuntimeError("intentional")
             self.calls.append(1)
@@ -935,52 +1149,41 @@ def test_reactive_class_exception_does_not_corrupt_wiring():
     except RuntimeError:
         pass
 
-    # Class must not be marked wired after the exception.
     descriptor = W.__dict__["refresh"]
     assert W not in descriptor._cls_wired, (
         "Class incorrectly marked wired after first-instance exception"
     )
 
-    # Successful call on a second instance must wire the class.
     bomb[0] = False
-    w2 = W()
-    w2.refresh()
+    w2 = W(); w2.refresh()
     assert len(w2.calls) == 1
 
-    r.settings.set("volume", 99)
+    r.translations.set_language("es")
     app.processEvents()
     assert len(w2.calls) == 2
 
-
 def test_reactive_class_reruns_on_theme_change():
-    """Class-level reactive methods must re-run on theme store changes
-    just as they do on settings store changes."""
     r = _make_class_registry()
     W = _make_class_widget(r)
-
     w = W(); w.refresh()
-
     r.theme.set_mode("light")
     app.processEvents()
     assert len(w.calls) == 2
     assert w.calls[-1][1] == "#fff"
 
-
-def test_reactive_class_tracks_both_stores():
-    """A class-level reactive method that reads from both stores must
-    re-run when either store changes."""
+def test_reactive_class_tracks_all_three_stores():
     r = _make_class_registry()
     W = _make_class_widget(r)
-
     w = W(); w.refresh()
-
     r.settings.set("volume", 1)
     app.processEvents()
     assert len(w.calls) == 2
-
     r.theme.set_mode("light")
     app.processEvents()
     assert len(w.calls) == 3
+    r.translations.set_language("es")
+    app.processEvents()
+    assert len(w.calls) == 4
 
 
 # ===========================================================================
@@ -1027,30 +1230,54 @@ TESTS = [
     ("theme: missing variant raises ValueError",            test_theme_missing_variant_raises),
     ("theme: re-registering active theme refreshes tokens", test_theme_register_replaces_active),
 
+    # TranslationStore
+    ("translations: get returns translated value",                      test_translations_get_returns_value),
+    ("translations: get missing key returns key as fallback",           test_translations_get_missing_key_returns_key),
+    ("translations: get missing key with custom fallback",              test_translations_get_missing_key_custom_fallback),
+    ("translations: get missing key with empty-string fallback",        test_translations_get_empty_string_fallback),
+    ("translations: get with interpolation",                            test_translations_get_interpolation),
+    ("translations: get interpolation bad kwarg returns raw string",    test_translations_get_interpolation_bad_key_returns_raw),
+    ("translations: active_language property",                          test_translations_active_language),
+    ("translations: set_language switches active pack",                 test_translations_set_language_switches_pack),
+    ("translations: as_dict returns snapshot",                          test_translations_as_dict_returns_snapshot),
+    ("translations: language_changed signal fires",                     test_translations_language_changed_signal),
+    ("translations: state committed before language_changed fires",     test_translations_language_changed_state_committed_before_signal),
+    ("translations: None value raises ValueError",                      test_translations_none_value_raises),
+    ("translations: set_language unknown raises KeyError",              test_translations_set_language_unknown_raises),
+    ("translations: unregister removes language",                       test_translations_unregister),
+    ("translations: unregister active language raises RuntimeError",    test_translations_unregister_active_raises),
+    ("translations: unregister unknown raises KeyError",                test_translations_unregister_unknown_raises),
+    ("translations: re-register active language refreshes tokens",      test_translations_register_replaces_active),
+    ("translations: re-register inactive language has no effect",       test_translations_register_replaces_inactive_no_effect),
+
     # @registry.reactive
-    ("reactive: first call runs method",                              test_reactive_first_call_runs),
-    ("reactive: reruns on settings change",                           test_reactive_reruns_on_settings_change),
-    ("reactive: reruns on theme change",                              test_reactive_reruns_on_theme_change),
-    ("reactive: tracks keys from both stores",                        test_reactive_tracks_both_stores),
-    ("reactive: duplicate key reads produce one connection",          test_reactive_no_duplicate_connections),
-    ("reactive: subsequent calls run without rewiring",               test_reactive_subsequent_calls_do_not_rewire),
-    ("reactive: GC disconnects signal connections",                   test_reactive_gc_disconnects),
-    ("reactive: two instances are independently wired",               test_reactive_instance_isolation),
-    ("reactive: exception on first call leaves no wiring state",      test_reactive_exception_does_not_leave_partial_wiring),
-    ("reactive: zero-key method runs without crash or wiring",        test_reactive_zero_keys_no_crash),
-    ("reactive: nested reactive calls track deps independently",      test_reactive_nested_calls_stack_safety),
+    ("reactive: first call runs method",                                           test_reactive_first_call_runs),
+    ("reactive: reruns on settings change",                                        test_reactive_reruns_on_settings_change),
+    ("reactive: reruns on theme change",                                           test_reactive_reruns_on_theme_change),
+    ("reactive: reruns on language change",                                        test_reactive_reruns_on_language_change),
+    ("reactive: tracks all three stores",                                          test_reactive_tracks_all_three_stores),
+    ("reactive: multiple translation keys produce one connection",                 test_reactive_language_single_connection_regardless_of_keys_read),
+    ("reactive: duplicate key reads produce one connection",                       test_reactive_no_duplicate_connections),
+    ("reactive: subsequent calls run without rewiring",                            test_reactive_subsequent_calls_do_not_rewire),
+    ("reactive: GC disconnects all signal connections incl. translation",          test_reactive_gc_disconnects),
+    ("reactive: two instances are independently wired",                            test_reactive_instance_isolation),
+    ("reactive: exception on first call leaves no wiring state",                   test_reactive_exception_does_not_leave_partial_wiring),
+    ("reactive: zero-key method runs without crash or wiring",                     test_reactive_zero_keys_no_crash),
+    ("reactive: nested reactive calls track deps independently",                   test_reactive_nested_calls_stack_safety),
 
     # @registry.reactive_class
-    ("reactive_class: first instance tracks and wires",               test_reactive_class_first_instance_tracks_and_wires),
-    ("reactive_class: second instance joins without rewiring",        test_reactive_class_second_instance_does_not_rewire),
-    ("reactive_class: all living instances rerun on dispatch",        test_reactive_class_all_instances_rerun_on_dispatch),
-    ("reactive_class: GC'd instance silently skipped on dispatch",    test_reactive_class_gcd_instance_skipped_on_dispatch),
-    ("reactive_class: connections persist after all instances GC'd",  test_reactive_class_connections_persist_after_all_instances_gcd),
-    ("reactive_class: multiple methods wire independently",           test_reactive_class_multiple_methods_wire_independently),
-    ("reactive_class: does not affect plain @reactive classes",       test_reactive_class_does_not_affect_other_classes),
-    ("reactive_class: exception on first call leaves no wiring",      test_reactive_class_exception_does_not_corrupt_wiring),
-    ("reactive_class: reruns on theme change",                        test_reactive_class_reruns_on_theme_change),
-    ("reactive_class: tracks both stores",                            test_reactive_class_tracks_both_stores),
+    ("reactive_class: first instance tracks and wires",                            test_reactive_class_first_instance_tracks_and_wires),
+    ("reactive_class: second instance joins without rewiring",                     test_reactive_class_second_instance_does_not_rewire),
+    ("reactive_class: all living instances rerun on dispatch",                     test_reactive_class_all_instances_rerun_on_dispatch),
+    ("reactive_class: reruns on language change",                                  test_reactive_class_reruns_on_language_change),
+    ("reactive_class: multiple translation keys produce one class connection",     test_reactive_class_language_single_connection),
+    ("reactive_class: GC'd instance silently skipped on dispatch",                 test_reactive_class_gcd_instance_skipped_on_dispatch),
+    ("reactive_class: connections persist after all instances GC'd",               test_reactive_class_connections_persist_after_all_instances_gcd),
+    ("reactive_class: multiple methods wire independently across all stores",      test_reactive_class_multiple_methods_wire_independently),
+    ("reactive_class: does not affect plain @reactive classes",                    test_reactive_class_does_not_affect_other_classes),
+    ("reactive_class: exception on first call leaves no wiring",                   test_reactive_class_exception_does_not_corrupt_wiring),
+    ("reactive_class: reruns on theme change",                                     test_reactive_class_reruns_on_theme_change),
+    ("reactive_class: tracks all three stores",                                    test_reactive_class_tracks_all_three_stores),
 ]
 
 
@@ -1072,8 +1299,6 @@ def _fmt_mem(nbytes):
 
 
 def _snap_mem():
-    """Take a tracemalloc snapshot and return net positive bytes since the
-    previous snapshot. tracemalloc must already be started by the caller."""
     return tracemalloc.take_snapshot()
 
 
@@ -1084,59 +1309,53 @@ def _net_bytes(before, after):
 # ===========================================================================
 # Benchmark 1 — Registry throughput (real PySide6 + real Registry)
 #
-# All four measurements share a single registry and a single pool of 10 000
-# wired instances so construction cost is paid once and is not counted in the
-# read or switch timings.
+# 10 000 QObject instances wired via @registry.reactive (per-instance).
+# Each instance reads 1 settings key + 10 theme tokens + 3 translation keys
+# on refresh(), producing 14 signal connections per instance:
+#   1  settings ("value")
+#   10 theme tokens ("token.0" … "token.9")
+#   1  translations ("_language" sentinel — one connection regardless of
+#      how many translation keys are read)
 #
-# Theme definition uses 10 fully-distinct tokens (all values differ between
-# dark and light) so every set_mode() flip triggers the maximum diff and
-# signal fan-out: 10 tokens x 10 000 instances = 100 000 deliveries per flip.
-#
-# Metrics
-# -------
-#   memory        — net Python heap delta (tracemalloc) while instances are
-#                   live, reported as total and per-instance.
-#                   Note: Qt C++ heap is not tracked by tracemalloc; actual
-#                   RSS will be higher. This measures Python-side overhead only.
-#
-#   settings read — wall time for N x READ_ITERATIONS calls to settings.get()
-#                   outside any tracking context (pure dict lookup + _record
-#                   no-op), plus throughput in calls/sec and cost per call.
-#
-#   theme read    — same, but for theme.get() across all 10 tokens per instance.
-#
-#   switch        — wall time for SWITCH_ITERATIONS set_mode() flips, each
-#                   followed by processEvents() to flush all signal deliveries.
-#                   One warm-up flip is performed first to avoid measuring
-#                   first-flip Qt machinery overhead. Reports per-switch
-#                   latency and aggregate signal delivery rate.
+# Switch benchmarks
+# -----------------
+#   Theme switch  — 20 set_mode() flips, each changing all 10 tokens.
+#                   10 changed tokens x 10 000 instances = 100 000 deliveries.
+#   Language switch — 20 set_language() calls (en ↔ es alternating).
+#                   1 sentinel signal x 10 000 instances = 10 000 deliveries.
+#                   Included to show the constant-cost model of translation
+#                   tracking vs per-token theme tracking.
 # ===========================================================================
 
-# 10-token theme: all values differ between dark and light so every mode flip
-# changes all 10 tokens and exercises the full diff + fan-out path.
 _BENCH_DARK  = {f"token.{i}": f"#dark{i:02d}" for i in range(10)}
 _BENCH_LIGHT = {f"token.{i}": f"#lite{i:02d}" for i in range(10)}
 _BENCH_THEME = {"dark": _BENCH_DARK, "light": _BENCH_LIGHT}
+_BENCH_EN    = {f"str.{i}": f"English string {i}" for i in range(3)}
+_BENCH_ES    = {f"str.{i}": f"Cadena española {i}" for i in range(3)}
 
 _B1_N_INSTANCES     = 10_000
-_B1_READ_ITERATIONS = 100   # repeat reads to get a stable wall-clock sample
-_B1_SWITCH_ITERS    = 20    # each flip is expensive; 20 gives a stable average
+_B1_READ_ITERATIONS = 100
+_B1_SWITCH_ITERS    = 20
 
 
 def _make_bench_registry():
-    """Fresh Registry with a 10-token theme and one settings key."""
+    """Fresh Registry with a 10-token theme, one settings key, and two
+    language packs (3 keys each)."""
     from Registry.Registry import Registry as _Registry
     r = _Registry()
     r.settings.set("value", 0)
     r.theme.register("bench", _BENCH_THEME)
     r.theme.set_theme("bench")
+    r.translations.register("en", _BENCH_EN)
+    r.translations.register("es", _BENCH_ES)
+    r.translations.set_language("en")
     return r
 
 
 def _make_bench_widget_class(r):
-    """QObject widget that reads one settings key + all 10 theme tokens on refresh.
-    Uses @registry.reactive (per-instance tracking): each instance gets its own
-    11 signal connections (1 settings + 10 theme)."""
+    """QObject widget that reads 1 settings key + 10 theme tokens + 3
+    translation keys on refresh(). Wires 12 connections per instance:
+      1 settings + 10 theme + 1 translation sentinel."""
 
     class BenchWidget(QObject):
         def __init__(self):
@@ -1147,20 +1366,19 @@ def _make_bench_widget_class(r):
             r.settings.get("value")
             for i in range(10):
                 r.theme.get(f"token.{i}")
+            for i in range(3):
+                r.translations.get(f"str.{i}")
 
     return BenchWidget
 
 
 def run_registry_benchmarks():
-    """Benchmark 1: Registry throughput with real PySide6 and 10 000 instances."""
-    print(f"\n{'─' * 64}")
+    print(f"\n{'─' * 68}")
     print(f"  Benchmark 1 — Registry throughput  (@registry.reactive, real PySide6)")
-    print(f"  {_B1_N_INSTANCES:,} QObject instances, 10-token theme")
-    print(f"{'─' * 64}")
+    print(f"  {_B1_N_INSTANCES:,} QObject instances, 10-token theme, 3-key translation pack")
+    print(f"  Connections per instance: 1 settings + 10 theme + 1 translation sentinel = 12")
+    print(f"{'─' * 68}")
 
-    # Create and wire all instances once. tracemalloc is active only during
-    # construction so the memory delta captures exactly the Python-side cost
-    # of 10 000 QObject instances + their 11 signal connections each.
     gc.collect()
     r = _make_bench_registry()
     BenchWidget = _make_bench_widget_class(r)
@@ -1169,34 +1387,31 @@ def run_registry_benchmarks():
     snap_before = _snap_mem()
     instances = [BenchWidget() for _ in range(_B1_N_INSTANCES)]
     for w in instances:
-        w.refresh()  # first call — wires 11 connections (1 settings + 10 theme)
+        w.refresh()
     snap_after = _snap_mem()
     tracemalloc.stop()
 
     # [1] Memory
     net = _net_bytes(snap_before, snap_after)
-    print(f"\n  [1/4] memory  ({_B1_N_INSTANCES:,} wired QObject instances)")
+    print(f"\n  [1/5] memory  ({_B1_N_INSTANCES:,} wired QObject instances)")
     print(f"    Python heap delta : {_fmt_mem(net)}")
     print(f"    per instance      : {_fmt_mem(net / _B1_N_INSTANCES)}")
     print(f"    note              : Qt C++ heap not included; actual RSS will be higher")
 
     # [2] Settings read throughput
-    # One settings.get("value") per instance per iteration, outside any
-    # tracking context — pure dict lookup + _record no-op overhead.
     t0 = time.perf_counter()
     for _ in range(_B1_READ_ITERATIONS):
         for _ in instances:
             r.settings.get("value")
     elapsed_s = time.perf_counter() - t0
     total_s = _B1_N_INSTANCES * _B1_READ_ITERATIONS
-    print(f"\n  [2/4] settings read  ({_B1_N_INSTANCES:,} instances x {_B1_READ_ITERATIONS} iterations)")
+    print(f"\n  [2/5] settings read  ({_B1_N_INSTANCES:,} instances x {_B1_READ_ITERATIONS} iterations)")
     print(f"    total calls  : {total_s:,}")
     print(f"    elapsed      : {_fmt_time(elapsed_s)}")
     print(f"    throughput   : {total_s / elapsed_s:,.0f} calls/sec")
     print(f"    per call     : {_fmt_time(elapsed_s / total_s)}")
 
     # [3] Theme read throughput
-    # 10 theme.get() calls per instance per iteration (all 10 tokens).
     t0 = time.perf_counter()
     for _ in range(_B1_READ_ITERATIONS):
         for _ in instances:
@@ -1204,90 +1419,82 @@ def run_registry_benchmarks():
                 r.theme.get(f"token.{i}")
     elapsed_t = time.perf_counter() - t0
     total_t = _B1_N_INSTANCES * 10 * _B1_READ_ITERATIONS
-    print(f"\n  [3/4] theme read  ({_B1_N_INSTANCES:,} instances x 10 tokens x {_B1_READ_ITERATIONS} iterations)")
+    print(f"\n  [3/5] theme read  ({_B1_N_INSTANCES:,} instances x 10 tokens x {_B1_READ_ITERATIONS} iterations)")
     print(f"    total calls  : {total_t:,}")
     print(f"    elapsed      : {_fmt_time(elapsed_t)}")
     print(f"    throughput   : {total_t / elapsed_t:,.0f} calls/sec")
     print(f"    per call     : {_fmt_time(elapsed_t / total_t)}")
 
-    # [4] Switch throughput
-    # Each set_mode() flip changes all 10 tokens -> 10 x 10 000 = 100 000
-    # signal deliveries. processEvents() flushes the full Qt signal queue.
-    # Alternates dark->light->dark so every flip is a genuine diff with no
-    # short-circuit. One warm-up flip precedes the timed loop.
-    r.theme.set_mode("light")  # warm-up: dark -> light
-    app.processEvents()
+    # [4] Translation read throughput
+    t0 = time.perf_counter()
+    for _ in range(_B1_READ_ITERATIONS):
+        for _ in instances:
+            for i in range(3):
+                r.translations.get(f"str.{i}")
+    elapsed_tr = time.perf_counter() - t0
+    total_tr = _B1_N_INSTANCES * 3 * _B1_READ_ITERATIONS
+    print(f"\n  [4/5] translation read  ({_B1_N_INSTANCES:,} instances x 3 keys x {_B1_READ_ITERATIONS} iterations)")
+    print(f"    total calls  : {total_tr:,}")
+    print(f"    elapsed      : {_fmt_time(elapsed_tr)}")
+    print(f"    throughput   : {total_tr / elapsed_tr:,.0f} calls/sec")
+    print(f"    per call     : {_fmt_time(elapsed_tr / total_tr)}")
+
+    # [5a] Theme switch throughput
+    r.theme.set_mode("light"); app.processEvents()  # warm-up
     t0 = time.perf_counter()
     for i in range(_B1_SWITCH_ITERS):
         r.theme.set_mode("dark" if i % 2 == 0 else "light")
         app.processEvents()
     elapsed_sw = time.perf_counter() - t0
-    deliveries_per_flip = _B1_N_INSTANCES * 10
+    deliveries_per_flip = _B1_N_INSTANCES * 10  # 10 changed tokens x N instances
     total_del = deliveries_per_flip * _B1_SWITCH_ITERS
-    print(f"\n  [4/4] switch  ({_B1_SWITCH_ITERS} set_mode() flips, "
-          f"{_B1_N_INSTANCES:,} instances x 10 tokens)")
-    print(f"    signal deliveries : {total_del:,} total  ({deliveries_per_flip:,} per flip)")
-    print(f"    total elapsed     : {_fmt_time(elapsed_sw)}")
-    print(f"    per flip          : {_fmt_time(elapsed_sw / _B1_SWITCH_ITERS)}")
-    print(f"    delivery rate     : {total_del / elapsed_sw:,.0f} signals/sec")
+    print(f"\n  [5/5] switches")
+    print(f"    Theme switch  ({_B1_SWITCH_ITERS} set_mode() flips, {_B1_N_INSTANCES:,} instances x 10 tokens)")
+    print(f"      signal deliveries : {total_del:,} total  ({deliveries_per_flip:,} per flip)")
+    print(f"      total elapsed     : {_fmt_time(elapsed_sw)}")
+    print(f"      per flip          : {_fmt_time(elapsed_sw / _B1_SWITCH_ITERS)}")
+    print(f"      delivery rate     : {total_del / elapsed_sw:,.0f} signals/sec")
+
+    # [5b] Language switch throughput
+    r.translations.set_language("es"); app.processEvents()  # warm-up
+    t0 = time.perf_counter()
+    for i in range(_B1_SWITCH_ITERS):
+        r.translations.set_language("en" if i % 2 == 0 else "es")
+        app.processEvents()
+    elapsed_lang = time.perf_counter() - t0
+    # One sentinel signal per instance (1 connection each, regardless of keys read)
+    lang_del_per_switch = _B1_N_INSTANCES * 1
+    total_lang_del = lang_del_per_switch * _B1_SWITCH_ITERS
+    print(f"\n    Language switch  ({_B1_SWITCH_ITERS} set_language() calls, {_B1_N_INSTANCES:,} instances x 1 sentinel)")
+    print(f"      signal deliveries : {total_lang_del:,} total  ({lang_del_per_switch:,} per switch)")
+    print(f"      total elapsed     : {_fmt_time(elapsed_lang)}")
+    print(f"      per switch        : {_fmt_time(elapsed_lang / _B1_SWITCH_ITERS)}")
+    print(f"      delivery rate     : {total_lang_del / elapsed_lang:,.0f} signals/sec")
+    print(f"\n    note: language switch is ~10x fewer deliveries than theme switch")
+    print(f"          because TranslationStore uses 1 sentinel connection per method,")
+    print(f"          not 1 per translation key.")
 
     del instances
     gc.collect()
-    print(f"\n{'─' * 64}")
+    print(f"\n{'─' * 68}")
 
 
 # ===========================================================================
 # Benchmark 2 — per-instance vs class-level comparison
-#               (real Registry + real PySide6 signals)
 #
-# Directly compares @registry.reactive (per-instance tracking) against
-# @registry.reactive_class (class-level tracking) using identical QObject-
-# based widgets and real SettingsModel stores so numbers are directly
-# comparable with Benchmark 1 and with each other.
+# Identical to the original but the widget now reads from all three stores:
+# 1 settings key + 10 theme tokens + 3 translation keys = 12 connections
+# per instance (per-instance mode) or 12 connections total (class-level mode).
 #
-# Each timing run creates a completely fresh SettingsModel + Registry +
-# Widget class so runs are fully isolated — no shared signal state bleeds
-# between iterations.
-#
-# Timing and memory are measured in separate passes:
-#   - Timing uses gc.disable() during each phase to eliminate GC jitter.
-#   - Memory uses a standalone tracemalloc pass without gc.collect() inside
-#     the window, which avoids the multi-second stall that running the full
-#     GC cycle on 10 000 QObject instances with 100 000 weakref finalizers
-#     would cause inside a tracemalloc context.
-#
-# Phases
-# ------
-#   Wiring      — create N QObject instances, each calls refresh() once.
-#                 Per-instance: N tracking passes + N x K PySide6 signal
-#                 connections wired via store.on(key).connect().
-#                 Class-level:  1 tracking pass + K connections total; every
-#                 subsequent instance just joins the shared WeakSet — free.
-#
-#   Dispatch    — fire each of the K keys once. Both modes call refresh() on
-#                 every instance (N x K total calls) so the raw work is
-#                 identical. The cost difference is N PySide6 signal dispatches
-#                 (per-instance) vs K dispatches + 1 WeakSet iteration
-#                 (class-level).
-#
-#   GC/cleanup  — del instances + gc.collect(). Per-instance: N weakref
-#                 finalizers each disconnect K signal handlers = N x K
-#                 disconnect() calls through PySide6. Class-level: zero
-#                 per-instance cleanup; the K class-level connections are
-#                 permanent for the class lifetime.
-#
-#   Memory      — tracemalloc net bytes while N instances are alive (after
-#                 wiring, before deletion). The gap between modes reflects the
-#                 N x K handler closures, weakref objects, and connection list
-#                 entries that per-instance tracking allocates per instance
-#                 but class-level does not. Both use QObject instances so the
-#                 baseline QObject overhead is identical and cancels out,
-#                 making the memory delta a clean measure of the reactivity
-#                 machinery cost alone.
+# The translation sentinel adds 1 connection per instance in per-instance mode
+# and 1 connection for the whole class in class-level mode, so the ratio
+# between the two modes grows slightly compared to the original 11-connection
+# benchmark.
 # ===========================================================================
 
 _B2_N_INSTANCES = 10_000
-_B2_N_KEYS      = 10
+_B2_N_KEYS      = 10   # theme/settings keys tracked per-key
+_B2_TR_KEYS     = 3    # translation keys read per refresh (all share 1 connection)
 _B2_KEYS        = [f"key_{i}" for i in range(_B2_N_KEYS)]
 _B2_RUNS        = 3
 
@@ -1295,34 +1502,35 @@ _b2_call_counter = 0
 
 
 def _b2_make_env(use_class_level):
-    """Fresh SettingsModel + descriptor + QObject Widget class per run.
+    """Fresh SettingsModel + TranslationStore + descriptors + Widget class.
 
-    Each call produces a fully isolated environment: a new SettingsModel with
-    its own PySide6 signals, a new descriptor instance with empty wiring
-    state, and a new Widget class. This ensures no signal connections or
-    wiring state leak between benchmark runs.
-
-    The Widget class uses @registry.reactive_class (class-level) or
-    @registry.reactive (per-instance) depending on use_class_level. In both
-    cases the widget inherits from QObject so the QObject construction
-    overhead is identical between the two modes.
+    Connections per instance (per-instance mode):
+      _B2_N_KEYS settings connections + 1 translation sentinel = N_KEYS+1
+    Connections total (class-level mode):
+      same N_KEYS+1, shared across all instances.
     """
     global _b2_call_counter
     store = SettingsModel()
     for k in _B2_KEYS:
         store.set(k, 0)
 
+    tr_store = TranslationStore()
+    tr_en = {f"str.{i}": f"en {i}" for i in range(_B2_TR_KEYS)}
+    tr_es = {f"str.{i}": f"es {i}" for i in range(_B2_TR_KEYS)}
+    tr_store.register("en", tr_en)
+    tr_store.register("es", tr_es)
+    tr_store.set_language("en")
+
     def refresh(self):
         global _b2_call_counter
         for k in _B2_KEYS:
             store.get(k)
+        for i in range(_B2_TR_KEYS):
+            tr_store.get(f"str.{i}")
         _b2_call_counter += 1
 
     if use_class_level:
-        # Build a fresh ReactiveDescriptor and apply the class-level marker
-        # directly so the benchmark doesn't depend on @registry.reactive_class
-        # being used as a decorator at class-definition time.
-        d = ReactiveDescriptor(refresh, stores=[store])
+        d = ReactiveDescriptor(refresh, stores=[store, tr_store])
 
         @reactive_class_decorator
         class Widget(QObject):
@@ -1330,25 +1538,21 @@ def _b2_make_env(use_class_level):
                 super().__init__()
             refresh = d
     else:
-        d = ReactiveDescriptor(refresh, stores=[store])
+        d = ReactiveDescriptor(refresh, stores=[store, tr_store])
 
         class Widget(QObject):
             def __init__(self):
                 super().__init__()
             refresh = d
 
-    return store, Widget
+    return store, tr_store, Widget
 
 
 def _b2_bench_timing(use_class_level):
-    """Time wiring, dispatch, and GC for one complete N-instance lifecycle."""
     global _b2_call_counter
-    store, Widget = _b2_make_env(use_class_level)
+    store, tr_store, Widget = _b2_make_env(use_class_level)
 
     # --- Wiring ---
-    # Create N QObject instances; each calls refresh() once.
-    # Per-instance: N tracking passes + N x K PySide6 signal connections.
-    # Class-level:  1 tracking pass + K connections; rest join the WeakSet.
     _b2_call_counter = 0
     gc.disable()
     t0 = time.perf_counter()
@@ -1357,63 +1561,51 @@ def _b2_bench_timing(use_class_level):
     t_wire = time.perf_counter() - t0
     gc.enable()
 
-    # --- Dispatch ---
-    # Fire each key once; measure the full fan-out to all N instances.
-    # Both modes deliver refresh() to every instance — same total work.
-    # Cost difference: N signal dispatches (per-instance) vs K dispatches
-    # + 1 WeakSet iteration (class-level).
+    # --- Dispatch (settings keys) ---
     _b2_call_counter = 0
     gc.disable()
     t0 = time.perf_counter()
     for k in _B2_KEYS: store.set(k, store.get(k) + 1)
-    t_dispatch = time.perf_counter() - t0
+    t_dispatch_s = time.perf_counter() - t0
     gc.enable()
-    dispatch_calls = _b2_call_counter
+    dispatch_calls_s = _b2_call_counter
+
+    # --- Dispatch (language switch) ---
+    _b2_call_counter = 0
+    gc.disable()
+    t0 = time.perf_counter()
+    tr_store.set_language("es")
+    t_dispatch_l = time.perf_counter() - t0
+    gc.enable()
+    dispatch_calls_l = _b2_call_counter
+
+    # Combined dispatch time for the comparison table
+    t_dispatch = t_dispatch_s + t_dispatch_l
 
     # --- GC ---
-    # Per-instance: N weakref finalizers each call disconnect() K times
-    # through PySide6 = N x K total disconnect() calls.
-    # Class-level: no per-instance finalizers; K class connections are
-    # permanent and never disconnected here.
     gc.disable()
     t0 = time.perf_counter()
     del instances; gc.collect()
     t_gc = time.perf_counter() - t0
     gc.enable()
 
-    return t_wire, t_dispatch, t_gc, dispatch_calls
+    return t_wire, t_dispatch, t_gc, dispatch_calls_s + dispatch_calls_l
 
 
 def _b2_bench_memory(use_class_level):
-    """Measure net Python heap bytes while N wired QObject instances are alive.
-
-    Run in a separate pass from timing so gc.collect() is never called inside
-    a tracemalloc window. Calling gc.collect() inside tracemalloc on 10 000
-    QObject instances with 100 000 weakref finalizers causes a multi-second
-    stall that would dominate the measurement.
-
-    Because both modes use QObject instances, the baseline QObject Python-side
-    overhead is identical. The delta between per-instance and class-level
-    therefore isolates the reactivity machinery cost: handler closures,
-    weakref objects, and connection list entries allocated per instance by
-    per-instance tracking but not by class-level tracking.
-    """
-    store, Widget = _b2_make_env(use_class_level)
-
+    store, tr_store, Widget = _b2_make_env(use_class_level)
     tracemalloc.start()
     snap_before = _snap_mem()
     instances = [Widget() for _ in range(_B2_N_INSTANCES)]
     for inst in instances: inst.refresh()
     snap_after = _snap_mem()
     tracemalloc.stop()
-
     mem_bytes = _net_bytes(snap_before, snap_after)
     del instances
     return mem_bytes
 
 
 def _b2_avg(fn, n, label):
-    """Run fn n times, printing progress, and return column-wise averages."""
     results = []
     for i in range(n):
         print(f"  {label} run {i+1}/{n}...", flush=True)
@@ -1423,11 +1615,13 @@ def _b2_avg(fn, n, label):
 
 
 def run_comparison_benchmark():
-    """Benchmark 2: per-instance vs class-level with real PySide6 QObjects."""
-    print(f"\n{'─' * 64}")
+    print(f"\n{'─' * 68}")
     print(f"  Benchmark 2 — per-instance vs class-level  (real PySide6 QObjects)")
-    print(f"  {_B2_N_INSTANCES:,} instances x {_B2_N_KEYS} keys  |  timing averaged over {_B2_RUNS} runs")
-    print(f"{'─' * 64}")
+    print(f"  {_B2_N_INSTANCES:,} instances x {_B2_N_KEYS} settings/theme keys + {_B2_TR_KEYS} translation keys")
+    print(f"  Connections: per-instance={_B2_N_INSTANCES*(_B2_N_KEYS+1):,}  "
+          f"class-level={_B2_N_KEYS+1}  (1 sentinel per class)")
+    print(f"  Timing averaged over {_B2_RUNS} runs")
+    print(f"{'─' * 68}")
 
     print("\n  Warming up...", flush=True)
     _b2_bench_timing(False); _b2_bench_timing(True)
@@ -1447,8 +1641,11 @@ def run_comparison_benchmark():
     def ratio(a, b): return f"{a/b:8.1f}x" if b > 0 else "     inf"
 
     W = 68
+    conns_pi = _B2_N_INSTANCES * (_B2_N_KEYS + 1)  # +1 for translation sentinel
+    conns_cl = _B2_N_KEYS + 1
     print(f"\n{'='*W}")
-    print(f"  {_B2_N_INSTANCES:,} instances x {_B2_N_KEYS} keys  |  timing averaged over {_B2_RUNS} runs")
+    print(f"  {_B2_N_INSTANCES:,} instances x {_B2_N_KEYS} keys + {_B2_TR_KEYS} translation keys")
+    print(f"  Timing averaged over {_B2_RUNS} runs")
     print(f"{'='*W}")
     print(f"\n  {'Phase':<20} {'per-instance':>16} {'class-level':>16} {'ratio':>10}")
     print(f"  {'-'*(W-2)}")
@@ -1468,9 +1665,11 @@ def run_comparison_benchmark():
     print(f"{'='*W}")
     print(f"\n  Dispatch calls:  per-instance={int(pi_t[3]):,}   class-level={int(cl_t[3]):,}")
     print(f"  Signal connections held:")
-    print(f"    per-instance : {_B2_N_INSTANCES*_B2_N_KEYS:,}  ({_B2_N_INSTANCES:,} instances x {_B2_N_KEYS} keys)")
-    print(f"    class-level  : {_B2_N_KEYS}  (1 class x {_B2_N_KEYS} keys)")
-    print(f"{'─' * 64}\n")
+    print(f"    per-instance : {conns_pi:,}  "
+          f"({_B2_N_INSTANCES:,} instances x ({_B2_N_KEYS} keys + 1 translation sentinel))")
+    print(f"    class-level  : {conns_cl}  "
+          f"({_B2_N_KEYS} keys + 1 translation sentinel, shared for whole class)")
+    print(f"{'─' * 68}\n")
 
 
 # ===========================================================================

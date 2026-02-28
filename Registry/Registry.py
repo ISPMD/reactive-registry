@@ -1,38 +1,43 @@
 """
 Registry.Registry
 -----------------
-Defines the Registry class, which owns a SettingsModel and a ThemeStore and
-exposes @registry.reactive and @registry.reactive_class as decorators that
-work across both stores.
+Defines the Registry class, which owns a SettingsModel, a ThemeStore, and a
+TranslationStore and exposes @registry.reactive and @registry.reactive_class
+as decorators that work across all three stores.
 
-Not imported directly — use `from Registry import settings, theme, registry`.
+Not imported directly — use `from Registry import settings, theme, translations, registry`.
 """
 
 from .Settings import SettingsModel
 from .Theme import ThemeStore
+from .Translation import TranslationStore
 from .Reactive import ReactiveDescriptor, reactive_class_decorator
 
 
 class Registry:
-    """Owns a SettingsModel and a ThemeStore and exposes the reactive decorators.
+    """Owns a SettingsModel, a ThemeStore, and a TranslationStore and exposes
+    the reactive decorators.
 
     Instantiated once at module level in __init__.py as the `registry`
     singleton. There is rarely a reason to instantiate Registry more than once;
-    doing so creates a fully isolated, independent pair of stores."""
+    doing so creates a fully isolated, independent set of stores."""
 
     def __init__(self):
         self.settings = SettingsModel()
         self.theme = ThemeStore()
+        self.translations = TranslationStore()
 
     def reactive(self, fn):
         """Decorator that auto-wires a method to every store key it reads.
 
-        Apply to any instance method that calls settings.get() or theme.get().
-        On the first call to the method on a given instance, all .get() accesses
-        are recorded across both stores. One Qt signal connection is created per
-        unique (store, key) pair so the method re-runs automatically on the same
-        instance whenever any of those values change — whether triggered by a
-        settings.set() call or a full theme/mode switch.
+        Apply to any instance method that calls settings.get(), theme.get(),
+        or translations.get(). On the first call to the method on a given
+        instance, all .get() accesses are recorded across all three stores.
+
+        For settings and theme, one Qt signal connection is created per unique
+        (store, key) pair. For translations, a single connection is wired per
+        method regardless of how many translation keys it reads — the entire
+        language pack is treated as one dependency.
 
         Connections are cleaned up automatically via a weakref finalizer when
         the instance is garbage collected — no manual disconnection is needed.
@@ -44,7 +49,7 @@ class Registry:
 
         See ReactiveDescriptor in Reactive.py for the full implementation.
         """
-        return ReactiveDescriptor(fn, stores=[self.settings, self.theme])
+        return ReactiveDescriptor(fn, stores=[self.settings, self.theme, self.translations])
 
     @staticmethod
     def reactive_class(cls):
@@ -71,18 +76,18 @@ class Registry:
         Usage::
 
             @registry.reactive_class
-            class VolumeLabel(QLabel):
+            class StatusLabel(QLabel):
 
                 @registry.reactive
                 def refresh(self):
-                    vol = settings.get("volume")
-                    bg  = theme.get("color.background")
-                    self.setText(f"Volume: {vol}")
+                    vol  = settings.get("volume")
+                    bg   = theme.get("color.background")
+                    text = translations.get("status.volume")
+                    self.setText(f"{text}: {vol}")
                     self.setStyleSheet(f"background: {bg};")
 
                 def __init__(self):
                     super().__init__()
-                    self.refresh()  # first instance: tracks + wires;
-                                    # later instances: join WeakSet + run
+                    self.refresh()
         """
         return reactive_class_decorator(cls)
