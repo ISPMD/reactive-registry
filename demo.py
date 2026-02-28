@@ -10,21 +10,32 @@ Right — two rows of reactive widgets:
           Row 1: PlayerCard  — uses @registry.reactive  (per-instance)
           Row 2: StatusBadge — uses @registry.reactive_class (class-level)
 Top   — Settings button opens a dialog to pick a theme and flip mode.
+         Save button writes registry state to demo_state.json.
+         State is auto-loaded from demo_state.json on startup if it exists.
 
 Run:
     python demo.py
 """
 
 import sys
+from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QSlider,
     QPushButton, QDialog, QFrame, QButtonGroup, QRadioButton,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 
 from Registry import settings, theme, translations, registry
+from Registry.Persistence import save, load
+
+
+# ---------------------------------------------------------------------------
+# Persistence path — sits next to demo.py
+# ---------------------------------------------------------------------------
+
+_STATE_PATH = Path(__file__).with_name("demo_state.json")
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +125,11 @@ translations.register("en", {
         "3 badges or 300 — still 6 signal connections total.",
     "window.title":            "Reactive Widgets",
     "button.settings":         "settings",
+    "button.save":             "save",
+    "status.saved":            "saved ✓",
+    "status.loaded":           "loaded ✓",
+    "status.save_err":         "save failed ✗",
+    "status.load_err":         "load failed ✗",
     "dialog.title":            "Settings",
     "dialog.theme":            "Theme",
     "dialog.mode":             "Mode",
@@ -144,6 +160,11 @@ translations.register("es", {
         "3 badges o 300 — solo 6 conexiones en total.",
     "window.title":            "Widgets Reactivos",
     "button.settings":         "ajustes",
+    "button.save":             "guardar",
+    "status.saved":            "guardado ✓",
+    "status.loaded":           "cargado ✓",
+    "status.save_err":         "error al guardar ✗",
+    "status.load_err":         "error al cargar ✗",
     "dialog.title":            "Ajustes",
     "dialog.theme":            "Tema",
     "dialog.mode":             "Modo",
@@ -174,6 +195,11 @@ translations.register("ro", {
         "3 sau 300 de badge-uri — tot 6 conexiuni în total.",
     "window.title":            "Widget-uri Reactive",
     "button.settings":         "setări",
+    "button.save":             "salvează",
+    "status.saved":            "salvat ✓",
+    "status.loaded":           "încărcat ✓",
+    "status.save_err":         "eroare la salvare ✗",
+    "status.load_err":         "eroare la încărcare ✗",
     "dialog.title":            "Setări",
     "dialog.theme":            "Temă",
     "dialog.mode":             "Mod",
@@ -204,6 +230,11 @@ translations.register("fr", {
         "3 badges ou 300 — seulement 6 connexions au total.",
     "window.title":            "Widgets Réactifs",
     "button.settings":         "réglages",
+    "button.save":             "sauvegarder",
+    "status.saved":            "sauvegardé ✓",
+    "status.loaded":           "chargé ✓",
+    "status.save_err":         "échec sauvegarde ✗",
+    "status.load_err":         "échec chargement ✗",
     "dialog.title":            "Réglages",
     "dialog.theme":            "Thème",
     "dialog.mode":             "Mode",
@@ -214,13 +245,29 @@ translations.register("fr", {
 })
 
 
-# Seed defaults
-settings.set("volume",     72)
-settings.set("brightness", 80)
+# ---------------------------------------------------------------------------
+# Seed defaults — used only when no saved state exists
+# ---------------------------------------------------------------------------
 
-theme.set_theme("Slate")
-theme.set_mode("dark")
-translations.set_language("en")
+def _seed_defaults():
+    settings.set("volume",     72)
+    settings.set("brightness", 80)
+    theme.set_theme("Slate")
+    theme.set_mode("dark")
+    translations.set_language("en")
+
+
+# Auto-load saved state; fall back to defaults if file is absent or broken.
+_load_result = load(_STATE_PATH)
+if _load_result.ok:
+    # Translations must be seeded even when loading, because load() only
+    # restores packs/languages that were present at save time — the four
+    # language packs above are registered fresh every run regardless.
+    # The active language was already restored by load(); nothing extra needed.
+    pass
+else:
+    # File missing or unreadable — seed defaults so the app starts cleanly.
+    _seed_defaults()
 
 
 # ---------------------------------------------------------------------------
@@ -318,8 +365,6 @@ class SettingsDialog(QDialog):
         self._lang_heading_lbl.setText(translations.get("dialog.language"))
         self._done_btn.setText(translations.get("dialog.done"))
 
-        # Keep language radio buttons in sync when language is switched
-        # from the control panel while the dialog is open
         active_lang = translations.active_language
         for code, rb in self._lang_rbs.items():
             rb.blockSignals(True)
@@ -457,7 +502,6 @@ class ControlPanel(QWidget):
         subtext = theme.get("color.subtext")
         accent  = theme.get("color.accent")
 
-        # Update translated labels
         self._heading_lbl.setText(translations.get("controls.heading"))
         self._vol_label.setText(translations.get("controls.volume"))
         self._bri_label.setText(translations.get("controls.brightness"))
@@ -467,7 +511,6 @@ class ControlPanel(QWidget):
         key = "controls.mode.to_light" if mode == "dark" else "controls.mode.to_dark"
         self._mode_btn.setText(translations.get(key))
 
-        # Highlight the active language button
         active_lang = translations.active_language
         for code, btn in self._lang_btns.items():
             btn.setChecked(code == active_lang)
@@ -650,6 +693,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setMinimumSize(860, 500)
 
+        # Timer used to clear the status label 2 s after a save/load.
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(self._clear_status)
+
         root_w = QWidget()
         self.setCentralWidget(root_w)
         root_h = QHBoxLayout(root_w)
@@ -669,18 +717,34 @@ class MainWindow(QMainWindow):
         right_v.setSpacing(20)
         root_h.addWidget(right_w, stretch=1)
 
-        # Top bar
+        # Top bar: title | stretch | status label | save btn | settings btn
         top = QHBoxLayout()
+
         self._title_lbl = QLabel()
         self._title_lbl.setFont(QFont("Courier New", 13, QFont.Bold))
         top.addWidget(self._title_lbl)
+
         top.addStretch()
+
+        # Status label — shows "saved ✓" / "loaded ✓" / error, then fades.
+        self._status_lbl = QLabel()
+        self._status_lbl.setFont(QFont("Courier New", 8))
+        self._status_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._status_lbl.hide()
+        top.addWidget(self._status_lbl)
+
+        self._save_btn = QPushButton()
+        self._save_btn.setFont(QFont("Courier New", 9))
+        self._save_btn.setCursor(Qt.PointingHandCursor)
+        self._save_btn.clicked.connect(self._on_save)
+        top.addWidget(self._save_btn)
 
         self._settings_btn = QPushButton()
         self._settings_btn.setFont(QFont("Courier New", 9))
         self._settings_btn.setCursor(Qt.PointingHandCursor)
         self._settings_btn.clicked.connect(self._open_settings)
         top.addWidget(self._settings_btn)
+
         right_v.addLayout(top)
 
         # Per-instance section
@@ -727,10 +791,47 @@ class MainWindow(QMainWindow):
 
         right_v.addStretch()
 
+        # Show "loaded ✓" if we successfully restored state on startup.
+        if _load_result.ok:
+            self._show_status(translations.get("status.loaded"), ok=True)
+
         self.apply_style()
+
+    # ------------------------------------------------------------------
+    # Save / load handlers
+    # ------------------------------------------------------------------
+
+    def _on_save(self):
+        result = save(_STATE_PATH)
+        if result.ok:
+            self._show_status(translations.get("status.saved"), ok=True)
+        else:
+            self._show_status(translations.get("status.save_err"), ok=False)
+
+    def _show_status(self, text: str, *, ok: bool):
+        """Display text in the status label and hide it after 2 s."""
+        accent = theme.get("color.accent")
+        err_color = "#ef4444"  # fixed red — readable on any theme
+        color = accent if ok else err_color
+        self._status_lbl.setStyleSheet(f"color:{color}; background:transparent;")
+        self._status_lbl.setText(text)
+        self._status_lbl.show()
+        self._status_timer.start(2000)
+
+    def _clear_status(self):
+        self._status_lbl.hide()
+        self._status_lbl.setText("")
+
+    # ------------------------------------------------------------------
+    # Settings dialog
+    # ------------------------------------------------------------------
 
     def _open_settings(self):
         SettingsDialog(self).exec()
+
+    # ------------------------------------------------------------------
+    # Reactive style
+    # ------------------------------------------------------------------
 
     @registry.reactive
     def apply_style(self):
@@ -743,6 +844,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(translations.get("window.title"))
         self._title_lbl.setText(translations.get("window.title"))
         self._settings_btn.setText(translations.get("button.settings"))
+        self._save_btn.setText(translations.get("button.save"))
         self._pi_tag.setText(translations.get("section.per_instance"))
         self._pi_note.setText(translations.get("section.per_instance.note"))
         self._cl_tag.setText(translations.get("section.class_level"))

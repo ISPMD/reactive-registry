@@ -21,6 +21,10 @@ Runs all unit tests first, then two benchmark suites:
      widgets and real stores so numbers are directly comparable and reflect
      what you would actually pay in a PySide6 application.
 
+  3. Persistence benchmark — measures save() and load() throughput across
+     varying store sizes (small / medium / large) and reports per-call timing
+     and file sizes.
+
 Covers
 ------
     SettingsModel    — get, set, on, changed, as_dict, load_dict, None policy
@@ -34,13 +38,20 @@ Covers
                                (settings + theme + translations), deduplication,
                                GC cleanup, one-connection-per-language semantics
     @registry.reactive_class — class-level equivalents of the above
+    Persistence      — save/load round-trip, file format, missing-file,
+                       malformed JSON, missing sections, None values in load,
+                       invalid theme definitions in load, result.ok / result.error
+                       / result.warnings contract
 """
 
 import sys
 import gc
 import weakref
 import time
+import json
+import tempfile
 import tracemalloc
+from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QObject
@@ -54,6 +65,7 @@ from Registry.Settings import SettingsModel
 from Registry.Theme import ThemeStore
 from Registry.Translation import TranslationStore
 from Registry.Reactive import ReactiveDescriptor, reactive_class_decorator
+from Registry.Persistence import save, load, SaveResult, LoadResult
 
 
 # ===========================================================================
@@ -1187,6 +1199,333 @@ def test_reactive_class_tracks_all_three_stores():
 
 
 # ===========================================================================
+# Persistence tests
+#
+# save() and load() operate on the module-level registry singleton, so these
+# tests use that singleton directly. Each test seeds the singleton stores with
+# known state, exercises save/load, then asserts the expected outcome.
+#
+# Isolation strategy: each test function is self-contained — it writes only the
+# keys/themes/packs it cares about and asserts only those. Tests do not assume
+# the stores are empty, so leftover state from other tests does not cause
+# spurious failures.
+#
+# File I/O uses tempfile.NamedTemporaryFile so no test artefacts are left on
+# disk regardless of pass/fail.
+# ===========================================================================
+
+def _tmp_path():
+    """Return a Path to a fresh temporary file (deleted on close by caller)."""
+    f = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    f.close()
+    return Path(f.name)
+
+
+def test_persistence_save_returns_ok():
+    """save() on a populated singleton registry must return result.ok == True."""
+    registry.settings.set("persist.volume", 42)
+    registry.theme.register("persist.base", DARK_LIGHT)
+    registry.theme.set_theme("persist.base")
+    registry.translations.register("persist.en", EN_PACK)
+    registry.translations.set_language("persist.en")
+
+    p = _tmp_path()
+    try:
+        result = save(p)
+        assert result.ok, f"save() returned ok=False: error={result.error}, warnings={result.warnings}"
+        assert result.error is None
+        assert result.warnings == []
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_save_creates_valid_json():
+    """The file written by save() must be valid JSON with the expected top-level keys."""
+    registry.settings.set("persist.check", 1)
+    p = _tmp_path()
+    try:
+        save(p)
+        raw = p.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+        assert isinstance(payload, dict), "Top-level value is not a dict"
+        assert "settings" in payload
+        assert "theme" in payload
+        assert "translations" in payload
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_round_trip_settings():
+    """Settings written by save() must be restored exactly by load()."""
+    registry.settings.set("persist.rt.volume", 77)
+    registry.settings.set("persist.rt.muted", True)
+
+    p = _tmp_path()
+    try:
+        save(p)
+
+        # Overwrite the values so we can verify load() restores them.
+        registry.settings.set("persist.rt.volume", 0)
+        registry.settings.set("persist.rt.muted", False)
+
+        result = load(p)
+        assert result.ok, f"load() returned ok=False: {result.error} / {result.warnings}"
+        assert registry.settings.get("persist.rt.volume") == 77
+        assert registry.settings.get("persist.rt.muted") == True
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_round_trip_theme():
+    """Theme definitions, active theme, and active mode must survive a round-trip."""
+    registry.theme.register("persist.rt.base", DARK_LIGHT)
+    registry.theme.register("persist.rt.second", SECOND_THEME)
+    registry.theme.set_theme("persist.rt.base")
+    registry.theme.set_mode("light")
+
+    p = _tmp_path()
+    try:
+        save(p)
+
+        # Switch away so load() has something to restore.
+        registry.theme.set_theme("persist.rt.second")
+        registry.theme.set_mode("dark")
+
+        result = load(p)
+        assert result.ok, f"load() returned ok=False: {result.error} / {result.warnings}"
+        assert registry.theme.active_theme == "persist.rt.base"
+        assert registry.theme.active_mode == "light"
+        assert registry.theme.get("color.bg") == "#fff"   # light variant of DARK_LIGHT
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_round_trip_translations():
+    """All registered packs and the active language must survive a round-trip."""
+    registry.translations.register("persist.rt.en", EN_PACK)
+    registry.translations.register("persist.rt.es", ES_PACK)
+    registry.translations.set_language("persist.rt.es")
+
+    p = _tmp_path()
+    try:
+        save(p)
+
+        # Switch away so load() has something to restore.
+        registry.translations.set_language("persist.rt.en")
+
+        result = load(p)
+        assert result.ok, f"load() returned ok=False: {result.error} / {result.warnings}"
+        assert registry.translations.active_language == "persist.rt.es"
+        assert registry.translations.get("greeting") == "Hola"
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_round_trip_all_stores():
+    """A single save/load cycle must restore all three stores simultaneously."""
+    registry.settings.set("persist.all.x", 99)
+    registry.theme.register("persist.all.base", DARK_LIGHT)
+    registry.theme.set_theme("persist.all.base")
+    registry.theme.set_mode("dark")
+    registry.translations.register("persist.all.en", EN_PACK)
+    registry.translations.set_language("persist.all.en")
+
+    p = _tmp_path()
+    try:
+        save(p)
+
+        registry.settings.set("persist.all.x", 0)
+        registry.theme.set_mode("light")
+        registry.translations.register("persist.all.es", ES_PACK)
+        registry.translations.set_language("persist.all.es")
+
+        result = load(p)
+        assert result.ok, f"load() returned ok=False: {result.error} / {result.warnings}"
+        assert registry.settings.get("persist.all.x") == 99
+        assert registry.theme.active_mode == "dark"
+        assert registry.theme.get("color.bg") == "#000"
+        assert registry.translations.active_language == "persist.all.en"
+        assert registry.translations.get("greeting") == "Hello"
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_load_missing_file():
+    """load() on a non-existent path must return result.ok=False with a
+    FileNotFoundError set on result.error. Stores must not be modified."""
+    before = registry.settings.get("persist.missing.sentinel", default="untouched")
+    result = load("/tmp/__registry_no_such_file_12345.json")
+    assert not result.ok
+    assert isinstance(result.error, FileNotFoundError)
+    assert registry.settings.get("persist.missing.sentinel", default="untouched") == before
+
+
+def test_persistence_load_malformed_json():
+    """load() on a file containing invalid JSON must return result.ok=False with
+    a json.JSONDecodeError and must not modify any stores."""
+    p = _tmp_path()
+    try:
+        p.write_text("{this is not valid json", encoding="utf-8")
+        result = load(p)
+        assert not result.ok
+        assert isinstance(result.error, json.JSONDecodeError)
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_load_non_object_json():
+    """load() on a file containing a JSON array (not an object) must fail cleanly."""
+    p = _tmp_path()
+    try:
+        p.write_text("[1, 2, 3]", encoding="utf-8")
+        result = load(p)
+        assert not result.ok
+        assert isinstance(result.error, ValueError)
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_load_missing_settings_section():
+    """A file with no 'settings' key must produce a warning and still load other stores."""
+    registry.translations.register("persist.sec.en", EN_PACK)
+    registry.translations.set_language("persist.sec.en")
+
+    p = _tmp_path()
+    try:
+        save(p)
+        # Strip out the settings section from the saved file.
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        del payload["settings"]
+        p.write_text(json.dumps(payload), encoding="utf-8")
+
+        result = load(p)
+        assert not result.ok
+        assert any("settings" in w for w in result.warnings), (
+            f"Expected a warning about missing settings section, got: {result.warnings}"
+        )
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_load_missing_theme_section():
+    """A file with no 'theme' key must produce a warning."""
+    p = _tmp_path()
+    try:
+        registry.settings.set("persist.theme_sec.x", 1)
+        save(p)
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        del payload["theme"]
+        p.write_text(json.dumps(payload), encoding="utf-8")
+
+        result = load(p)
+        assert not result.ok
+        assert any("theme" in w for w in result.warnings), (
+            f"Expected a warning about missing theme section, got: {result.warnings}"
+        )
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_load_missing_translations_section():
+    """A file with no 'translations' key must produce a warning."""
+    p = _tmp_path()
+    try:
+        registry.settings.set("persist.tr_sec.x", 1)
+        save(p)
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        del payload["translations"]
+        p.write_text(json.dumps(payload), encoding="utf-8")
+
+        result = load(p)
+        assert not result.ok
+        assert any("translations" in w for w in result.warnings), (
+            f"Expected a warning about missing translations section, got: {result.warnings}"
+        )
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_load_none_value_in_settings_produces_warning():
+    """A None value in the settings section of the JSON must be skipped with a
+    warning rather than crashing."""
+    p = _tmp_path()
+    try:
+        registry.settings.set("persist.none.good", 1)
+        save(p)
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        payload["settings"]["persist.none.injected"] = None
+        p.write_text(json.dumps(payload), encoding="utf-8")
+
+        result = load(p)
+        assert not result.ok
+        assert any("persist.none.injected" in w for w in result.warnings), (
+            f"Expected a warning about None value, got: {result.warnings}"
+        )
+        # The None key must not have been set in the store.
+        assert registry.settings.get("persist.none.injected") is None
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_load_invalid_theme_definition_produces_warning():
+    """A theme definition missing a variant must produce a warning and not crash."""
+    p = _tmp_path()
+    try:
+        registry.settings.set("persist.bad_theme.x", 1)
+        save(p)
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        # Insert a malformed theme (missing 'light' variant).
+        payload["theme"]["themes"]["persist.bad_theme"] = {"dark": {"x": "#000"}}
+        p.write_text(json.dumps(payload), encoding="utf-8")
+
+        result = load(p)
+        assert not result.ok
+        assert any("persist.bad_theme" in w for w in result.warnings), (
+            f"Expected a warning about the bad theme, got: {result.warnings}"
+        )
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_save_result_type():
+    """save() must always return a SaveResult instance."""
+    p = _tmp_path()
+    try:
+        result = save(p)
+        assert isinstance(result, SaveResult)
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_persistence_load_result_type():
+    """load() must always return a LoadResult instance, even on failure."""
+    result = load("/tmp/__registry_no_such_file_99999.json")
+    assert isinstance(result, LoadResult)
+
+
+def test_persistence_save_bad_path():
+    """save() to an unwritable path must return result.ok=False with result.error set."""
+    result = save("/no_such_directory/registry_test.json")
+    assert not result.ok
+    assert result.error is not None
+
+
+def test_persistence_file_is_human_readable():
+    """The saved JSON must be indented (pretty-printed), not a single line."""
+    registry.settings.set("persist.readable.x", 1)
+    p = _tmp_path()
+    try:
+        save(p)
+        raw = p.read_text(encoding="utf-8")
+        lines = raw.splitlines()
+        assert len(lines) > 5, (
+            "JSON appears to be a single line — expected indented output"
+        )
+    finally:
+        p.unlink(missing_ok=True)
+
+
+# ===========================================================================
 # Test registry
 # ===========================================================================
 
@@ -1278,6 +1617,26 @@ TESTS = [
     ("reactive_class: exception on first call leaves no wiring",                   test_reactive_class_exception_does_not_corrupt_wiring),
     ("reactive_class: reruns on theme change",                                     test_reactive_class_reruns_on_theme_change),
     ("reactive_class: tracks all three stores",                                    test_reactive_class_tracks_all_three_stores),
+
+    # Persistence
+    ("persistence: save() returns SaveResult with ok=True",                        test_persistence_save_returns_ok),
+    ("persistence: save() writes valid JSON with all three sections",              test_persistence_save_creates_valid_json),
+    ("persistence: round-trip restores settings values",                           test_persistence_round_trip_settings),
+    ("persistence: round-trip restores theme definitions and active state",        test_persistence_round_trip_theme),
+    ("persistence: round-trip restores translation packs and active language",     test_persistence_round_trip_translations),
+    ("persistence: round-trip restores all three stores simultaneously",           test_persistence_round_trip_all_stores),
+    ("persistence: load() missing file → ok=False, FileNotFoundError",            test_persistence_load_missing_file),
+    ("persistence: load() malformed JSON → ok=False, JSONDecodeError",            test_persistence_load_malformed_json),
+    ("persistence: load() non-object JSON → ok=False, ValueError",                test_persistence_load_non_object_json),
+    ("persistence: load() missing settings section → warning, no crash",          test_persistence_load_missing_settings_section),
+    ("persistence: load() missing theme section → warning, no crash",             test_persistence_load_missing_theme_section),
+    ("persistence: load() missing translations section → warning, no crash",      test_persistence_load_missing_translations_section),
+    ("persistence: load() None value in settings → warning, key skipped",         test_persistence_load_none_value_in_settings_produces_warning),
+    ("persistence: load() invalid theme definition → warning, no crash",          test_persistence_load_invalid_theme_definition_produces_warning),
+    ("persistence: save() always returns SaveResult",                              test_persistence_save_result_type),
+    ("persistence: load() always returns LoadResult, even on failure",            test_persistence_load_result_type),
+    ("persistence: save() to unwritable path → ok=False, error set",              test_persistence_save_bad_path),
+    ("persistence: saved JSON is human-readable (indented)",                       test_persistence_file_is_human_readable),
 ]
 
 
@@ -1308,23 +1667,6 @@ def _net_bytes(before, after):
 
 # ===========================================================================
 # Benchmark 1 — Registry throughput (real PySide6 + real Registry)
-#
-# 10 000 QObject instances wired via @registry.reactive (per-instance).
-# Each instance reads 1 settings key + 10 theme tokens + 3 translation keys
-# on refresh(), producing 14 signal connections per instance:
-#   1  settings ("value")
-#   10 theme tokens ("token.0" … "token.9")
-#   1  translations ("_language" sentinel — one connection regardless of
-#      how many translation keys are read)
-#
-# Switch benchmarks
-# -----------------
-#   Theme switch  — 20 set_mode() flips, each changing all 10 tokens.
-#                   10 changed tokens x 10 000 instances = 100 000 deliveries.
-#   Language switch — 20 set_language() calls (en ↔ es alternating).
-#                   1 sentinel signal x 10 000 instances = 10 000 deliveries.
-#                   Included to show the constant-cost model of translation
-#                   tracking vs per-token theme tracking.
 # ===========================================================================
 
 _BENCH_DARK  = {f"token.{i}": f"#dark{i:02d}" for i in range(10)}
@@ -1339,8 +1681,6 @@ _B1_SWITCH_ITERS    = 20
 
 
 def _make_bench_registry():
-    """Fresh Registry with a 10-token theme, one settings key, and two
-    language packs (3 keys each)."""
     from Registry.Registry import Registry as _Registry
     r = _Registry()
     r.settings.set("value", 0)
@@ -1353,10 +1693,6 @@ def _make_bench_registry():
 
 
 def _make_bench_widget_class(r):
-    """QObject widget that reads 1 settings key + 10 theme tokens + 3
-    translation keys on refresh(). Wires 12 connections per instance:
-      1 settings + 10 theme + 1 translation sentinel."""
-
     class BenchWidget(QObject):
         def __init__(self):
             super().__init__()
@@ -1391,14 +1727,12 @@ def run_registry_benchmarks():
     snap_after = _snap_mem()
     tracemalloc.stop()
 
-    # [1] Memory
     net = _net_bytes(snap_before, snap_after)
     print(f"\n  [1/5] memory  ({_B1_N_INSTANCES:,} wired QObject instances)")
     print(f"    Python heap delta : {_fmt_mem(net)}")
     print(f"    per instance      : {_fmt_mem(net / _B1_N_INSTANCES)}")
     print(f"    note              : Qt C++ heap not included; actual RSS will be higher")
 
-    # [2] Settings read throughput
     t0 = time.perf_counter()
     for _ in range(_B1_READ_ITERATIONS):
         for _ in instances:
@@ -1411,7 +1745,6 @@ def run_registry_benchmarks():
     print(f"    throughput   : {total_s / elapsed_s:,.0f} calls/sec")
     print(f"    per call     : {_fmt_time(elapsed_s / total_s)}")
 
-    # [3] Theme read throughput
     t0 = time.perf_counter()
     for _ in range(_B1_READ_ITERATIONS):
         for _ in instances:
@@ -1425,7 +1758,6 @@ def run_registry_benchmarks():
     print(f"    throughput   : {total_t / elapsed_t:,.0f} calls/sec")
     print(f"    per call     : {_fmt_time(elapsed_t / total_t)}")
 
-    # [4] Translation read throughput
     t0 = time.perf_counter()
     for _ in range(_B1_READ_ITERATIONS):
         for _ in instances:
@@ -1439,14 +1771,13 @@ def run_registry_benchmarks():
     print(f"    throughput   : {total_tr / elapsed_tr:,.0f} calls/sec")
     print(f"    per call     : {_fmt_time(elapsed_tr / total_tr)}")
 
-    # [5a] Theme switch throughput
-    r.theme.set_mode("light"); app.processEvents()  # warm-up
+    r.theme.set_mode("light"); app.processEvents()
     t0 = time.perf_counter()
     for i in range(_B1_SWITCH_ITERS):
         r.theme.set_mode("dark" if i % 2 == 0 else "light")
         app.processEvents()
     elapsed_sw = time.perf_counter() - t0
-    deliveries_per_flip = _B1_N_INSTANCES * 10  # 10 changed tokens x N instances
+    deliveries_per_flip = _B1_N_INSTANCES * 10
     total_del = deliveries_per_flip * _B1_SWITCH_ITERS
     print(f"\n  [5/5] switches")
     print(f"    Theme switch  ({_B1_SWITCH_ITERS} set_mode() flips, {_B1_N_INSTANCES:,} instances x 10 tokens)")
@@ -1455,14 +1786,12 @@ def run_registry_benchmarks():
     print(f"      per flip          : {_fmt_time(elapsed_sw / _B1_SWITCH_ITERS)}")
     print(f"      delivery rate     : {total_del / elapsed_sw:,.0f} signals/sec")
 
-    # [5b] Language switch throughput
-    r.translations.set_language("es"); app.processEvents()  # warm-up
+    r.translations.set_language("es"); app.processEvents()
     t0 = time.perf_counter()
     for i in range(_B1_SWITCH_ITERS):
         r.translations.set_language("en" if i % 2 == 0 else "es")
         app.processEvents()
     elapsed_lang = time.perf_counter() - t0
-    # One sentinel signal per instance (1 connection each, regardless of keys read)
     lang_del_per_switch = _B1_N_INSTANCES * 1
     total_lang_del = lang_del_per_switch * _B1_SWITCH_ITERS
     print(f"\n    Language switch  ({_B1_SWITCH_ITERS} set_language() calls, {_B1_N_INSTANCES:,} instances x 1 sentinel)")
@@ -1481,20 +1810,11 @@ def run_registry_benchmarks():
 
 # ===========================================================================
 # Benchmark 2 — per-instance vs class-level comparison
-#
-# Identical to the original but the widget now reads from all three stores:
-# 1 settings key + 10 theme tokens + 3 translation keys = 12 connections
-# per instance (per-instance mode) or 12 connections total (class-level mode).
-#
-# The translation sentinel adds 1 connection per instance in per-instance mode
-# and 1 connection for the whole class in class-level mode, so the ratio
-# between the two modes grows slightly compared to the original 11-connection
-# benchmark.
 # ===========================================================================
 
 _B2_N_INSTANCES = 10_000
-_B2_N_KEYS      = 10   # theme/settings keys tracked per-key
-_B2_TR_KEYS     = 3    # translation keys read per refresh (all share 1 connection)
+_B2_N_KEYS      = 10
+_B2_TR_KEYS     = 3
 _B2_KEYS        = [f"key_{i}" for i in range(_B2_N_KEYS)]
 _B2_RUNS        = 3
 
@@ -1502,13 +1822,6 @@ _b2_call_counter = 0
 
 
 def _b2_make_env(use_class_level):
-    """Fresh SettingsModel + TranslationStore + descriptors + Widget class.
-
-    Connections per instance (per-instance mode):
-      _B2_N_KEYS settings connections + 1 translation sentinel = N_KEYS+1
-    Connections total (class-level mode):
-      same N_KEYS+1, shared across all instances.
-    """
     global _b2_call_counter
     store = SettingsModel()
     for k in _B2_KEYS:
@@ -1552,7 +1865,6 @@ def _b2_bench_timing(use_class_level):
     global _b2_call_counter
     store, tr_store, Widget = _b2_make_env(use_class_level)
 
-    # --- Wiring ---
     _b2_call_counter = 0
     gc.disable()
     t0 = time.perf_counter()
@@ -1561,7 +1873,6 @@ def _b2_bench_timing(use_class_level):
     t_wire = time.perf_counter() - t0
     gc.enable()
 
-    # --- Dispatch (settings keys) ---
     _b2_call_counter = 0
     gc.disable()
     t0 = time.perf_counter()
@@ -1570,7 +1881,6 @@ def _b2_bench_timing(use_class_level):
     gc.enable()
     dispatch_calls_s = _b2_call_counter
 
-    # --- Dispatch (language switch) ---
     _b2_call_counter = 0
     gc.disable()
     t0 = time.perf_counter()
@@ -1579,10 +1889,8 @@ def _b2_bench_timing(use_class_level):
     gc.enable()
     dispatch_calls_l = _b2_call_counter
 
-    # Combined dispatch time for the comparison table
     t_dispatch = t_dispatch_s + t_dispatch_l
 
-    # --- GC ---
     gc.disable()
     t0 = time.perf_counter()
     del instances; gc.collect()
@@ -1641,7 +1949,7 @@ def run_comparison_benchmark():
     def ratio(a, b): return f"{a/b:8.1f}x" if b > 0 else "     inf"
 
     W = 68
-    conns_pi = _B2_N_INSTANCES * (_B2_N_KEYS + 1)  # +1 for translation sentinel
+    conns_pi = _B2_N_INSTANCES * (_B2_N_KEYS + 1)
     conns_cl = _B2_N_KEYS + 1
     print(f"\n{'='*W}")
     print(f"  {_B2_N_INSTANCES:,} instances x {_B2_N_KEYS} keys + {_B2_TR_KEYS} translation keys")
@@ -1673,6 +1981,118 @@ def run_comparison_benchmark():
 
 
 # ===========================================================================
+# Benchmark 3 — Persistence throughput
+#
+# Measures save() and load() across three store sizes:
+#   small  —   10 settings keys,  1 theme (3 tokens),  2 language packs ( 10 keys)
+#   medium —  100 settings keys,  3 themes (20 tokens), 5 language packs ( 50 keys)
+#   large  — 1000 settings keys, 10 themes (50 tokens), 10 language packs (200 keys)
+#
+# Each size is run _B3_RUNS times; timing is averaged. File size is also
+# reported so you can see how payload size scales.
+# ===========================================================================
+
+_B3_RUNS = 5
+
+
+def _b3_make_registry(n_settings, n_themes, tokens_per_theme, n_langs, keys_per_lang):
+    """Return a fresh Registry populated to the requested scale."""
+    from Registry.Registry import Registry as _Registry
+    r = _Registry()
+
+    for i in range(n_settings):
+        r.settings.set(f"key.{i}", i)
+
+    for t in range(n_themes):
+        definition = {
+            "dark":  {f"token.{k}": f"#dark{t:02d}{k:03d}" for k in range(tokens_per_theme)},
+            "light": {f"token.{k}": f"#lite{t:02d}{k:03d}" for k in range(tokens_per_theme)},
+        }
+        r.theme.register(f"theme.{t}", definition)
+    r.theme.set_theme("theme.0")
+
+    for lang_idx in range(n_langs):
+        lang = f"lang.{lang_idx}"
+        pack = {f"str.{k}": f"Translation {lang_idx}-{k}" for k in range(keys_per_lang)}
+        r.translations.register(lang, pack)
+    r.translations.set_language("lang.0")
+
+    return r
+
+
+def _b3_bench_save(r, path, runs):
+    times = []
+    for _ in range(runs):
+        from Registry.Persistence import save as _save
+        # Temporarily monkey-patch the module's registry reference so save()
+        # uses our isolated registry instance rather than the singleton.
+        import Registry.Persistence as _pm
+        _orig = _pm.registry
+        _pm.registry = r
+        try:
+            t0 = time.perf_counter()
+            _save(path)
+            times.append(time.perf_counter() - t0)
+        finally:
+            _pm.registry = _orig
+    return sum(times) / len(times), path.stat().st_size
+
+
+def _b3_bench_load(r, path, runs):
+    times = []
+    for _ in range(runs):
+        from Registry.Persistence import load as _load
+        import Registry.Persistence as _pm
+        _orig = _pm.registry
+        _pm.registry = r
+        try:
+            t0 = time.perf_counter()
+            _load(path)
+            times.append(time.perf_counter() - t0)
+        finally:
+            _pm.registry = _orig
+    return sum(times) / len(times)
+
+
+def run_persistence_benchmark():
+    print(f"\n{'─' * 68}")
+    print(f"  Benchmark 3 — Persistence throughput  (save / load, {_B3_RUNS} runs each)")
+    print(f"{'─' * 68}")
+
+    sizes = [
+        ("small",  10,   1,  3,  2,  10),
+        ("medium", 100,  3, 20,  5,  50),
+        ("large",  1000, 10, 50, 10, 200),
+    ]
+    # (label, n_settings, n_themes, tokens_per_theme, n_langs, keys_per_lang)
+
+    W = 68
+    print(f"\n  {'Size':<8} {'Settings':>10} {'Themes':>8} {'Langs':>7} "
+          f"{'File':>9} {'save()':>10} {'load()':>10}")
+    print(f"  {'-'*(W-2)}")
+
+    p = _tmp_path()
+    try:
+        for label, n_s, n_t, tok, n_l, kpl in sizes:
+            r = _b3_make_registry(n_s, n_t, tok, n_l, kpl)
+            avg_save, file_size = _b3_bench_save(r, p, _B3_RUNS)
+            avg_load            = _b3_bench_load(r, p, _B3_RUNS)
+
+            print(
+                f"  {label:<8} {n_s:>10,} {n_t:>8} {n_l:>7} "
+                f"{_fmt_mem(file_size):>9} {_fmt_time(avg_save):>10} {_fmt_time(avg_load):>10}"
+            )
+    finally:
+        p.unlink(missing_ok=True)
+
+    print(f"  {'-'*(W-2)}")
+    print(f"\n  note: file sizes include indentation (json.dumps indent=2).")
+    print(f"        load() re-registers all themes/packs and re-activates the")
+    print(f"        active theme/language on every call — it is not purely I/O.")
+    print(f"\n{'─' * 68}\n")
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 
@@ -1689,6 +2109,7 @@ if __name__ == "__main__":
 
     run_registry_benchmarks()
     run_comparison_benchmark()
+    run_persistence_benchmark()
 
     if failed:
         sys.exit(1)
