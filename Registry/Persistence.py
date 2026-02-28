@@ -5,64 +5,77 @@ Save and load Registry stores to and from JSON files.
 Part of the Registry package — import alongside the stores:
 
     from Registry import settings, theme, translations
-    from Registry.Persistence import save, load, LoadResult
+    from Registry.Persistence import (
+        save, load,
+        save_state, load_state,
+        save_themes, load_themes,
+        save_translations, load_translations,
+    )
 
-All three stores are persisted in a single JSON file with the structure:
+Functions
+---------
+All save functions take only a file path and return a SaveResult.
+All load functions take only a file path and return a LoadResult.
 
-    {
-        "settings": {
-            "volume": 80,
-            "muted": false
-        },
-        "theme": {
-            "active_theme": "catppuccin",
-            "active_mode": "dark",
-            "themes": {
-                "catppuccin": {
-                    "dark":  {"color.background": "#1e1e2e"},
-                    "light": {"color.background": "#eff1f5"}
-                }
-            }
-        },
-        "translations": {
-            "active_language": "en",
-            "packs": {
-                "en": {"greeting": "Hello"},
-                "es": {"greeting": "Hola"}
-            }
+save(path) / load(path)
+    Everything: settings values, full theme definitions, full translation
+    packs, active theme/mode/language. File format:
+        {
+            "settings":     { "volume": 80, ... },
+            "theme":        { "active_theme": "Slate", "active_mode": "dark",
+                              "themes": { "Slate": { "dark": {...}, "light": {...} }, ... } },
+            "translations": { "active_language": "en",
+                              "packs": { "en": {...}, "es": {...}, ... } }
         }
-    }
 
-Public API
-----------
-Saving:
-    result = save(path)
-    # Writes all three stores to a JSON file at path.
-    # Returns a SaveResult. Check result.ok or result.error.
+save_state(path) / load_state(path)
+    Active state only — no theme definitions, no translation pack strings.
+    Use this when themes and translations are always registered from code at
+    startup and only the current selection needs to persist. File format:
+        {
+            "settings":        { "volume": 80, ... },
+            "active_theme":    "Slate",
+            "active_mode":     "dark",
+            "active_language": "en"
+        }
+    load_state() calls set_theme() and set_language() with the stored names,
+    so the themes and packs must already be registered before calling it.
 
-Loading:
-    result = load(path)
-    # Reads the JSON file and restores all three stores.
-    # Returns a LoadResult. Check result.ok or result.error.
-    # Partial loads are possible — see LoadResult for details.
+save_themes(path) / load_themes(path)
+    Full ThemeStore: all registered definitions plus active theme and mode.
+    File format:
+        {
+            "active_theme": "Slate",
+            "active_mode":  "dark",
+            "themes": { "Slate": { "dark": {...}, "light": {...} }, ... }
+        }
 
-Results:
-    result.ok       — True if the operation fully succeeded
-    result.error    — Exception instance if a top-level failure occurred,
-                      None otherwise
-    result.warnings — list of non-fatal per-store warnings (e.g. one store
-                      failed but others succeeded)
+save_translations(path) / load_translations(path)
+    Full TranslationStore: all registered packs plus active language.
+    File format:
+        {
+            "active_language": "en",
+            "packs": { "en": { "greeting": "Hello", ... }, ... }
+        }
+
+Results
+-------
+    result.ok       — True if the operation fully succeeded with no warnings
+    result.error    — Exception if a fatal error occurred, None otherwise
+    result.warnings — list of non-fatal per-key/store issues
 
     if not result.ok:
-        print(result.error)
+        print(result.error, result.warnings)
 
-None policy:
-    None values stored in SettingsModel cannot be saved (SettingsModel already
-    rejects None at write time, so this situation should never arise in practice).
-    None values encountered during load are skipped with a warning.
+None policy
+-----------
+    None is not a valid settings value. set() already enforces this, so it
+    cannot appear in a saved file. None values encountered during load are
+    skipped with a warning rather than crashing.
 
-Thread safety:
-    save() and load() must be called from the Qt main thread. They call store
+Thread safety
+-------------
+    All functions must be called from the Qt main thread. They call store
     methods (set(), register(), set_theme(), etc.) which are not thread-safe.
     See Registry.Settings for the rationale.
 """
@@ -82,21 +95,17 @@ from . import registry
 
 @dataclass
 class SaveResult:
-    """Result returned by save().
+    """Returned by every save function.
 
     Attributes
     ----------
     ok : bool
-        True if the file was written successfully without any errors or
-        warnings. False if a top-level failure occurred (see error) or if any
-        per-store warnings were raised (see warnings).
+        True if the file was written with no errors or warnings.
     error : Exception | None
-        Set to the exception if the overall save operation failed (e.g. a
-        permission error writing the file). None on success.
+        Set if a fatal error occurred (e.g. permission denied). None on success.
     warnings : list[str]
-        Non-fatal issues encountered while serializing individual stores
-        (e.g. a store returned unexpected data). The file may still have been
-        written with partial data.
+        Non-fatal issues (e.g. a single bad value skipped). ok is False
+        whenever warnings is non-empty.
     """
     ok: bool = True
     error: Exception | None = None
@@ -105,22 +114,18 @@ class SaveResult:
 
 @dataclass
 class LoadResult:
-    """Result returned by load().
+    """Returned by every load function.
 
     Attributes
     ----------
     ok : bool
-        True if the file was read and all three stores were restored without
-        any errors or warnings. False if a top-level failure occurred (see
-        error) or if any per-store warnings were raised (see warnings).
+        True if the file was read and all data restored with no warnings.
     error : Exception | None
-        Set to the exception if the overall load operation failed (e.g. the
-        file does not exist, or the top-level JSON is malformed). None on
-        success. When error is set, no stores will have been modified.
+        Set if a fatal error occurred (missing file, bad JSON, wrong top-level
+        type). When set, no stores have been modified.
     warnings : list[str]
-        Non-fatal issues encountered while restoring individual stores (e.g. a
-        single invalid value was skipped, or one store's section was missing).
-        Other stores may have been restored successfully.
+        Non-fatal issues (e.g. a missing section, a skipped None value). ok is
+        False whenever warnings is non-empty.
     """
     ok: bool = True
     error: Exception | None = None
@@ -128,43 +133,99 @@ class LoadResult:
 
 
 # ---------------------------------------------------------------------------
-# Serialization helpers
+# Internal: JSON I/O helpers
 # ---------------------------------------------------------------------------
 
-def _serialize_settings(settings) -> dict:
-    return settings.as_dict()
+def _write(path: str | Path, payload: dict) -> SaveResult:
+    """Serialize payload to indented JSON at path. Returns a SaveResult."""
+    result = SaveResult()
+    try:
+        Path(path).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        result.ok = False
+        result.error = exc
+    return result
 
 
-def _serialize_theme(theme) -> dict:
+def _read(path: str | Path) -> tuple[dict | None, LoadResult]:
+    """Read and parse a JSON file. Returns (payload, result).
+
+    On any failure result.ok is False and result.error is set; payload is None.
+    On success payload is a dict and result.ok is True.
+    """
+    result = LoadResult()
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except FileNotFoundError as exc:
+        result.ok = False
+        result.error = exc
+        return None, result
+    except json.JSONDecodeError as exc:
+        result.ok = False
+        result.error = exc
+        return None, result
+    except Exception as exc:
+        result.ok = False
+        result.error = exc
+        return None, result
+
+    if not isinstance(payload, dict):
+        result.ok = False
+        result.error = ValueError(
+            f"Expected a JSON object at the top level, got {type(payload).__name__!r}."
+        )
+        return None, result
+
+    return payload, result
+
+
+# ---------------------------------------------------------------------------
+# Internal: serialization helpers
+# ---------------------------------------------------------------------------
+
+def _serialize_settings(s) -> dict:
+    return s.as_dict()
+
+
+def _serialize_theme_full(t) -> dict:
     return {
-        "active_theme": theme.active_theme,
-        "active_mode": theme.active_mode,
-        "themes": {
-            name: definition
-            for name, definition in theme._themes.items()
-        },
+        "active_theme": t.active_theme,
+        "active_mode":  t.active_mode,
+        "themes":       {name: defn for name, defn in t._themes.items()},
     }
 
 
-def _serialize_translations(translations) -> dict:
+def _serialize_translations_full(tr) -> dict:
     return {
-        "active_language": translations.active_language,
-        "packs": dict(translations._packs),
+        "active_language": tr.active_language,
+        "packs":           dict(tr._packs),
+    }
+
+
+def _serialize_state(s, t, tr) -> dict:
+    """Active-state-only payload: settings values + active selections."""
+    return {
+        "settings":        s.as_dict(),
+        "active_theme":    t.active_theme,
+        "active_mode":     t.active_mode,
+        "active_language": tr.active_language,
     }
 
 
 # ---------------------------------------------------------------------------
-# Deserialization helpers
+# Internal: restoration helpers
 # ---------------------------------------------------------------------------
 
-def _restore_settings(settings, data: dict, warnings: list[str]) -> None:
-    """Restore SettingsModel from a plain dict."""
+def _restore_settings(s, data: dict, warnings: list[str]) -> None:
     if not isinstance(data, dict):
         warnings.append(
             f"settings: expected a dict, got {type(data).__name__!r} — skipped."
         )
         return
-
     for key, value in data.items():
         if value is None:
             warnings.append(
@@ -172,13 +233,13 @@ def _restore_settings(settings, data: dict, warnings: list[str]) -> None:
             )
             continue
         try:
-            settings.set(key, value)
+            s.set(key, value)
         except Exception as exc:
             warnings.append(f"settings: could not set {key!r}: {exc}")
 
 
-def _restore_theme(theme, data: dict, warnings: list[str]) -> None:
-    """Restore ThemeStore from a serialized dict."""
+def _restore_theme_full(t, data: dict, warnings: list[str]) -> None:
+    """Register all themes from data, then activate the stored theme/mode."""
     if not isinstance(data, dict):
         warnings.append(
             f"theme: expected a dict, got {type(data).__name__!r} — skipped."
@@ -190,31 +251,34 @@ def _restore_theme(theme, data: dict, warnings: list[str]) -> None:
         warnings.append("theme: 'themes' is not a dict — skipped.")
         return
 
-    # Register all themes first so set_theme() can succeed.
     for name, definition in themes.items():
         try:
-            theme.register(name, definition)
+            t.register(name, definition)
         except Exception as exc:
             warnings.append(f"theme: could not register theme {name!r}: {exc}")
 
-    # Restore active theme and mode.
+    _restore_theme_active(t, data, warnings)
+
+
+def _restore_theme_active(t, data: dict, warnings: list[str]) -> None:
+    """Activate the theme and mode stored in data (no registration)."""
     active_theme = data.get("active_theme")
-    active_mode = data.get("active_mode", "dark")
+    active_mode  = data.get("active_mode", "dark")
 
     if active_theme is not None:
         try:
-            theme.set_theme(active_theme)
+            t.set_theme(active_theme)
         except Exception as exc:
             warnings.append(f"theme: could not activate theme {active_theme!r}: {exc}")
 
     try:
-        theme.set_mode(active_mode)
+        t.set_mode(active_mode)
     except Exception as exc:
         warnings.append(f"theme: could not set mode {active_mode!r}: {exc}")
 
 
-def _restore_translations(translations, data: dict, warnings: list[str]) -> None:
-    """Restore TranslationStore from a serialized dict."""
+def _restore_translations_full(tr, data: dict, warnings: list[str]) -> None:
+    """Register all packs from data, then activate the stored language."""
     if not isinstance(data, dict):
         warnings.append(
             f"translations: expected a dict, got {type(data).__name__!r} — skipped."
@@ -226,20 +290,23 @@ def _restore_translations(translations, data: dict, warnings: list[str]) -> None
         warnings.append("translations: 'packs' is not a dict — skipped.")
         return
 
-    # Register all packs first so set_language() can succeed.
     for language, pack in packs.items():
         try:
-            translations.register(language, pack)
+            tr.register(language, pack)
         except Exception as exc:
             warnings.append(
                 f"translations: could not register language {language!r}: {exc}"
             )
 
-    # Restore active language.
+    _restore_translations_active(tr, data, warnings)
+
+
+def _restore_translations_active(tr, data: dict, warnings: list[str]) -> None:
+    """Activate the language stored in data (no pack registration)."""
     active_language = data.get("active_language")
     if active_language is not None:
         try:
-            translations.set_language(active_language)
+            tr.set_language(active_language)
         except Exception as exc:
             warnings.append(
                 f"translations: could not activate language {active_language!r}: {exc}"
@@ -251,94 +318,38 @@ def _restore_translations(translations, data: dict, warnings: list[str]) -> None
 # ---------------------------------------------------------------------------
 
 def save(path: str | Path) -> SaveResult:
-    """Serialize all three stores to a JSON file at path.
+    """Save everything: settings, full theme definitions, full translation packs,
+    and all active selections to a single JSON file.
 
-    Creates or overwrites the file. Parent directories must already exist.
-
-    Parameters
-    ----------
-    path : str | Path
-        Destination file path. Typically ends in ".json".
-
-    Returns
-    -------
-    SaveResult
-        result.ok is True if the file was written without issues.
-        result.error holds the exception on failure.
-        result.warnings lists any non-fatal serialization issues.
+    Use load() to restore. Themes and translations are re-registered from the
+    file, so the calling code does not need to register them at startup when
+    this file is present.
     """
-    result = SaveResult()
-
     try:
         payload = {
             "settings":     _serialize_settings(registry.settings),
-            "theme":        _serialize_theme(registry.theme),
-            "translations": _serialize_translations(registry.translations),
+            "theme":        _serialize_theme_full(registry.theme),
+            "translations": _serialize_translations_full(registry.translations),
         }
     except Exception as exc:
-        result.ok = False
-        result.error = exc
-        return result
+        return SaveResult(ok=False, error=exc)
 
-    try:
-        path = Path(path)
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception as exc:
-        result.ok = False
-        result.error = exc
-        return result
-
+    result = _write(path, payload)
     if result.warnings:
         result.ok = False
-
     return result
 
 
 def load(path: str | Path) -> LoadResult:
-    """Restore all three stores from a JSON file at path.
+    """Restore everything from a file written by save().
 
-    Parameters
-    ----------
-    path : str | Path
-        Source file path produced by save().
-
-    Returns
-    -------
-    LoadResult
-        result.ok is True if the file was read and all stores restored cleanly.
-        result.error holds the exception if the file could not be read or parsed
-        at the top level — in that case no stores are modified.
-        result.warnings lists any non-fatal per-store issues (skipped keys,
-        missing sections, etc.). Other stores may still have been restored.
+    On a fatal read/parse error result.error is set and no stores are touched.
+    Per-store failures are non-fatal and collected into result.warnings.
     """
-    result = LoadResult()
-
-    # --- Read and parse the file ---
-    try:
-        path = Path(path)
-        raw = path.read_text(encoding="utf-8")
-        payload = json.loads(raw)
-    except FileNotFoundError as exc:
-        result.ok = False
-        result.error = exc
-        return result
-    except json.JSONDecodeError as exc:
-        result.ok = False
-        result.error = exc
-        return result
-    except Exception as exc:
-        result.ok = False
-        result.error = exc
+    payload, result = _read(path)
+    if payload is None:
         return result
 
-    if not isinstance(payload, dict):
-        result.ok = False
-        result.error = ValueError(
-            f"Expected a JSON object at the top level, got {type(payload).__name__!r}."
-        )
-        return result
-
-    # --- Restore each store, collecting per-store warnings ---
     settings_data = payload.get("settings")
     if settings_data is None:
         result.warnings.append("settings: section missing from file — skipped.")
@@ -349,15 +360,131 @@ def load(path: str | Path) -> LoadResult:
     if theme_data is None:
         result.warnings.append("theme: section missing from file — skipped.")
     else:
-        _restore_theme(registry.theme, theme_data, result.warnings)
+        _restore_theme_full(registry.theme, theme_data, result.warnings)
 
     translations_data = payload.get("translations")
     if translations_data is None:
         result.warnings.append("translations: section missing from file — skipped.")
     else:
-        _restore_translations(registry.translations, translations_data, result.warnings)
+        _restore_translations_full(registry.translations, translations_data, result.warnings)
 
     if result.warnings:
         result.ok = False
+    return result
 
+
+def save_state(path: str | Path) -> SaveResult:
+    """Save active state only: all settings values plus the active theme name,
+    active mode, and active language — no theme definitions or pack strings.
+
+    Intended for apps that always register themes and translations from code at
+    startup. load_state() will call set_theme() and set_language() with the
+    stored names, so the relevant themes and packs must already be registered
+    before calling it.
+    """
+    try:
+        payload = _serialize_state(
+            registry.settings, registry.theme, registry.translations
+        )
+    except Exception as exc:
+        return SaveResult(ok=False, error=exc)
+
+    result = _write(path, payload)
+    if result.warnings:
+        result.ok = False
+    return result
+
+
+def load_state(path: str | Path) -> LoadResult:
+    """Restore active state from a file written by save_state().
+
+    Restores all settings values and calls set_theme(), set_mode(), and
+    set_language() with the stored names. Themes and language packs must
+    already be registered before calling this.
+
+    On a fatal read/parse error result.error is set and no stores are touched.
+    """
+    payload, result = _read(path)
+    if payload is None:
+        return result
+
+    settings_data = payload.get("settings")
+    if settings_data is None:
+        result.warnings.append("settings: section missing from file — skipped.")
+    else:
+        _restore_settings(registry.settings, settings_data, result.warnings)
+
+    _restore_theme_active(registry.theme, payload, result.warnings)
+    _restore_translations_active(registry.translations, payload, result.warnings)
+
+    if result.warnings:
+        result.ok = False
+    return result
+
+
+def save_themes(path: str | Path) -> SaveResult:
+    """Save the full ThemeStore: all registered theme definitions plus the
+    active theme name and mode.
+
+    Use load_themes() to restore.
+    """
+    try:
+        payload = _serialize_theme_full(registry.theme)
+    except Exception as exc:
+        return SaveResult(ok=False, error=exc)
+
+    result = _write(path, payload)
+    if result.warnings:
+        result.ok = False
+    return result
+
+
+def load_themes(path: str | Path) -> LoadResult:
+    """Restore the full ThemeStore from a file written by save_themes().
+
+    Re-registers all theme definitions and activates the stored theme and mode.
+    On a fatal read/parse error result.error is set and the store is not touched.
+    """
+    payload, result = _read(path)
+    if payload is None:
+        return result
+
+    _restore_theme_full(registry.theme, payload, result.warnings)
+
+    if result.warnings:
+        result.ok = False
+    return result
+
+
+def save_translations(path: str | Path) -> SaveResult:
+    """Save the full TranslationStore: all registered language packs plus the
+    active language name.
+
+    Use load_translations() to restore.
+    """
+    try:
+        payload = _serialize_translations_full(registry.translations)
+    except Exception as exc:
+        return SaveResult(ok=False, error=exc)
+
+    result = _write(path, payload)
+    if result.warnings:
+        result.ok = False
+    return result
+
+
+def load_translations(path: str | Path) -> LoadResult:
+    """Restore the full TranslationStore from a file written by save_translations().
+
+    Re-registers all language packs and activates the stored language.
+    On a fatal read/parse error result.error is set and the store is not touched.
+    """
+    payload, result = _read(path)
+    if payload is None:
+        return result
+
+    _restore_translations_full(registry.translations, payload, result.warnings)
+
+    if result.warnings:
+        result.ok = False
     return result

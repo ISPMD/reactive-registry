@@ -3,7 +3,7 @@
 A reactive key/value store system for PySide6 applications. Combines a **settings store**, a **theme store**, and a **translation store** under a single registry, with a `@registry.reactive` decorator that automatically re-runs methods when the values they read change — no manual signal wiring required.
 
 
-# Work in progress - 0.3
+# Work in progress - 0.4
 
 ---
 
@@ -19,7 +19,8 @@ your_project/
 │   ├── Reactive.py
 │   ├── Settings.py
 │   ├── Theme.py
-│   └── Translation.py
+│   ├── Translation.py
+│   └── Persistence.py
 └── your_app.py
 ```
 
@@ -167,12 +168,12 @@ translations.register("es", {
 translations.set_language("en")   # activate a language pack
 
 # Reading
-translations.get("volume.label")            # translated string
-translations.get("missing.key")             # returns "missing.key" if not found
+translations.get("volume.label")                 # translated string
+translations.get("missing.key")                  # returns "missing.key" if not found
 translations.get("missing.key", fallback="???")  # custom fallback
-translations.get("welcome", name="Alice")   # with interpolation → "Hello, Alice!"
-translations.active_language                # name of active language (str | None)
-translations.as_dict()                      # shallow snapshot of active pack
+translations.get("welcome", name="Alice")        # with interpolation → "Hello, Alice!"
+translations.active_language                     # name of active language (str | None)
+translations.as_dict()                           # shallow snapshot of active pack
 
 # Subscribing manually
 translations.language_changed.connect(cb)   # cb(language_name) on every switch
@@ -191,6 +192,164 @@ translations.unregister("en")  # raises RuntimeError if currently active
 ```
 
 > **None policy:** `None` is not a valid translation value. `register()` raises `ValueError` if any value in the pack is `None`.
+
+---
+
+## Persistence
+
+Save and load registry state to and from JSON files. All functions take only a file path and return a result object.
+
+```python
+from Registry.Persistence import (
+    save, load,
+    save_state, load_state,
+    save_themes, load_themes,
+    save_translations, load_translations,
+)
+```
+
+### Functions
+
+There are four pairs of functions, each covering a different scope:
+
+| Pair | What it covers |
+|---|---|
+| `save` / `load` | Everything: settings, full theme definitions, full translation packs, active selections |
+| `save_state` / `load_state` | Active state only: settings values + active theme name, mode, and language |
+| `save_themes` / `load_themes` | Full ThemeStore: all registered definitions + active theme and mode |
+| `save_translations` / `load_translations` | Full TranslationStore: all registered packs + active language |
+
+### Choosing the right pair
+
+**`save` / `load`** — use when you want the file to be fully self-contained. Themes and translations are re-registered from the file on load, so the calling code does not need to register them at startup.
+
+**`save_state` / `load_state`** — use when themes and translations are always registered from code at startup and only the current user selection needs to persist (which theme is active, which language is selected, what the slider values are). The file is small and load is fast. `load_state()` calls `set_theme()` and `set_language()` with the stored names, so the relevant themes and packs must already be registered before calling it.
+
+**`save_themes` / `load_themes`** — use when you want to persist theme definitions independently, for example when themes are user-created or loaded from a separate themes file at startup.
+
+**`save_translations` / `load_translations`** — use when language packs are loaded from a separate translations file rather than being hardcoded.
+
+### Usage
+
+```python
+from Registry.Persistence import save, load, save_state, load_state
+
+# Save and load everything
+result = save("app_data.json")
+result = load("app_data.json")
+
+# Save and load active state only
+# (themes and translations must already be registered)
+result = save_state("app_state.json")
+result = load_state("app_state.json")
+
+# Save and load stores individually
+result = save_themes("themes.json")
+result = load_themes("themes.json")
+
+result = save_translations("translations.json")
+result = load_translations("translations.json")
+```
+
+### Results
+
+Every function returns a `SaveResult` or `LoadResult` with three fields:
+
+```python
+result.ok        # True if the operation fully succeeded with no warnings
+result.error     # Exception if a fatal error occurred, None otherwise
+result.warnings  # list[str] of non-fatal per-key/store issues
+
+if not result.ok:
+    if result.error:
+        print("Fatal:", result.error)
+    for w in result.warnings:
+        print("Warning:", w)
+```
+
+`result.ok` is `False` whenever either `result.error` is set **or** `result.warnings` is non-empty. For load functions, `result.error` means no stores were modified. Warnings mean the load completed partially — other stores or keys may have been restored successfully.
+
+### Common patterns
+
+**Auto-load on startup, fall back to defaults:**
+
+```python
+from Registry.Persistence import load_state
+
+# Register themes and translations from code first
+theme.register("catppuccin", { ... })
+translations.register("en", { ... })
+translations.register("es", { ... })
+
+# Then restore the user's last selection
+result = load_state("app_state.json")
+if not result.ok:
+    # File missing or unreadable — apply defaults
+    theme.set_theme("catppuccin")
+    theme.set_mode("dark")
+    translations.set_language("en")
+    settings.set("volume", 75)
+```
+
+**Save on exit:**
+
+```python
+app.aboutToQuit.connect(lambda: save_state("app_state.json"))
+```
+
+**Save with error reporting:**
+
+```python
+result = save_state("app_state.json")
+if not result.ok:
+    print(f"Could not save: {result.error}")
+```
+
+### File formats
+
+`save_state` produces a flat object — the most compact format:
+
+```json
+{
+  "settings": { "volume": 80, "muted": false },
+  "active_theme": "catppuccin",
+  "active_mode": "dark",
+  "active_language": "en"
+}
+```
+
+`save_themes` produces a standalone theme file:
+
+```json
+{
+  "active_theme": "catppuccin",
+  "active_mode": "dark",
+  "themes": {
+    "catppuccin": {
+      "dark":  { "color.background": "#1e1e2e", "color.text": "#cdd6f4" },
+      "light": { "color.background": "#eff1f5", "color.text": "#4c4f69" }
+    }
+  }
+}
+```
+
+`save_translations` produces a standalone translations file:
+
+```json
+{
+  "active_language": "en",
+  "packs": {
+    "en": { "volume.label": "Volume", "welcome": "Hello, {name}!" },
+    "es": { "volume.label": "Volumen", "welcome": "Hola, {name}!" }
+  }
+}
+```
+
+`save` combines all three stores under `"settings"`, `"theme"`, and `"translations"` keys in a single file.
+
+> **None policy:** `None` is not a valid settings value and cannot appear in a saved file. `None` values encountered in a file during load are skipped with a warning rather than crashing.
+
+> **Thread safety:** All persistence functions must be called from the Qt main thread.
 
 ---
 
@@ -289,7 +448,7 @@ This constraint applies to `theme.get()` as well. It does **not** apply to `tran
 ## How tracking works internally
 
 1. The first call runs the method inside a tracking context.
-2. Every `.get()` call appends `(store, key)` to the active context's dependency list.  For `translations`, the key is always a fixed sentinel (`"_language"`) regardless of which string was requested, so all translation reads collapse into one dependency.
+2. Every `.get()` call appends `(store, key)` to the active context's dependency list. For `translations`, the key is always a fixed sentinel (`"_language"`) regardless of which string was requested, so all translation reads collapse into one dependency.
 3. After the method returns, the list is deduplicated and one Qt signal connection is created per unique `(store, key)` pair.
 4. The signal handler re-runs the method on the same instance whenever that key changes.
 5. Subsequent calls skip tracking and run the method directly.
@@ -301,7 +460,7 @@ Tracking uses a per-thread stack of dependency lists, so nested reactive calls e
 
 ## Thread safety
 
-`settings.set()`, `theme.set_theme()`, `theme.set_mode()`, `theme.register()`, and `translations.set_language()` must be called from the **Qt main thread**. To update state from a worker thread, post to the main thread via `QMetaObject.invokeMethod` or a queued signal connection.
+`settings.set()`, `theme.set_theme()`, `theme.set_mode()`, `theme.register()`, `translations.set_language()`, and all persistence functions must be called from the **Qt main thread**. To update state from a worker thread, post to the main thread via `QMetaObject.invokeMethod` or a queued signal connection.
 
 ---
 
@@ -327,6 +486,11 @@ from Registry import settings      # SettingsModel singleton
 from Registry import theme         # ThemeStore singleton
 from Registry import translations  # TranslationStore singleton
 from Registry import registry      # Registry singleton (needed for @registry.reactive)
+
+from Registry.Persistence import save, load
+from Registry.Persistence import save_state, load_state
+from Registry.Persistence import save_themes, load_themes
+from Registry.Persistence import save_translations, load_translations
 ```
 
 Do not import `Settings`, `Theme`, `Translation`, or `Reactive` directly in application code.
